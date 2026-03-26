@@ -243,10 +243,18 @@ class EchoCache {
 // Signal envelope types (from signal-cli SSE)
 // ---------------------------------------------------------------------------
 
+interface SignalQuote {
+  id?: number;
+  authorNumber?: string;
+  authorUuid?: string;
+  text?: string;
+}
+
 interface SignalDataMessage {
   timestamp?: number;
   message?: string;
   groupInfo?: { groupId?: string; groupName?: string; type?: string };
+  quote?: SignalQuote;
   attachments?: Array<{
     id?: string;
     contentType?: string;
@@ -535,12 +543,22 @@ export class SignalChannel implements Channel {
           return;
         }
 
+        let syncContent = text;
+        if (syncSent.quote) {
+          const q = syncSent.quote;
+          const quoteAuthor = q.authorNumber ?? 'someone';
+          const quoteText = q.text ?? '';
+          if (quoteText) {
+            syncContent = `> ${quoteAuthor}: ${quoteText}\n\n${syncContent}`;
+          }
+        }
+
         this.opts.onMessage(chatJid, {
           id: String(syncSent.timestamp ?? Date.now()),
           chat_jid: chatJid,
           sender: this.account,
           sender_name: 'Me',
-          content: text,
+          content: syncContent,
           timestamp,
           is_from_me: true,
         });
@@ -597,6 +615,16 @@ export class SignalChannel implements Channel {
     }
 
     let content = text;
+
+    // Prepend quote context so the agent sees what's being replied to
+    if (dataMessage.quote) {
+      const q = dataMessage.quote;
+      const quoteAuthor = q.authorNumber ?? 'someone';
+      const quoteText = q.text ?? '';
+      if (quoteText) {
+        content = `> ${quoteAuthor}: ${quoteText}\n\n${content}`;
+      }
+    }
 
     // Trigger detection for groups
     if (isGroup && !TRIGGER_PATTERN.test(content)) {
