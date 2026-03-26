@@ -389,8 +389,10 @@ export class SignalChannel implements Channel {
 
     for (const chunk of chunks) {
       try {
-        const params: Record<string, unknown> = { message: chunk };
+        const { text: plainText, textStyles } = parseSignalStyles(chunk);
+        const params: Record<string, unknown> = { message: plainText };
         if (this.account) params.account = this.account;
+        if (textStyles.length > 0) params.textStyle = textStyles;
 
         if (target.startsWith('group:')) {
           params.groupId = target.slice('group:'.length);
@@ -398,7 +400,19 @@ export class SignalChannel implements Channel {
           params.recipient = [target];
         }
 
-        await signalRpc(this.baseUrl, 'send', params);
+        try {
+          await signalRpc(this.baseUrl, 'send', params);
+        } catch (styledErr) {
+          // Older signal-cli may not support textStyle — retry without
+          if (textStyles.length > 0) {
+            logger.debug('Signal: textStyle rejected, retrying plain');
+            delete params.textStyle;
+            params.message = chunk;
+            await signalRpc(this.baseUrl, 'send', params);
+          } else {
+            throw styledErr;
+          }
+        }
       } catch (err) {
         logger.error({ jid, err }, 'Signal: send failed');
       }
@@ -674,6 +688,75 @@ function escapeRegex(str: string): string {
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+// ---------------------------------------------------------------------------
+// Signal text styles — convert Markdown to Signal's offset-based formatting
+// ---------------------------------------------------------------------------
+
+interface SignalTextStyle {
+  style: 'BOLD' | 'ITALIC' | 'STRIKETHROUGH' | 'MONOSPACE' | 'SPOILER';
+  start: number;
+  length: number;
+}
+
+interface StyledText {
+  text: string;
+  textStyles: SignalTextStyle[];
+}
+
+/**
+ * Parse Markdown-style formatting into Signal's native text styles.
+ * Returns plain text (markup stripped) and an array of style ranges.
+ * Offsets are in UTF-16 code units (JavaScript string indices).
+ */
+function parseSignalStyles(input: string): StyledText {
+  const styles: SignalTextStyle[] = [];
+
+  // Process code blocks first (``` ... ```) to prevent inner markup parsing
+  // Then inline patterns: **bold**, *bold*, _italic_, ~~strike~~, `mono`
+  const patterns: Array<{
+    regex: RegExp;
+    style: SignalTextStyle['style'];
+  }> = [
+    { regex: /```([\s\S]*?)```/g, style: 'MONOSPACE' },
+    { regex: /`([^`]+)`/g, style: 'MONOSPACE' },
+    { regex: /\*\*(.+?)\*\*/g, style: 'BOLD' },
+    { regex: /\*(.+?)\*/g, style: 'BOLD' },
+    { regex: /_(.+?)_/g, style: 'ITALIC' },
+    { regex: /~~(.+?)~~/g, style: 'STRIKETHROUGH' },
+  ];
+
+  let text = input;
+
+  for (const { regex, style } of patterns) {
+    const nextText: string[] = [];
+    let lastIndex = 0;
+    let offset = 0;
+
+    for (const match of text.matchAll(regex)) {
+      const fullMatch = match[0];
+      const innerText = match[1];
+      const matchStart = match.index!;
+
+      // Copy text before this match
+      nextText.push(text.slice(lastIndex, matchStart));
+      const plainStart = matchStart - offset;
+
+      // Add the inner text (without markup)
+      nextText.push(innerText);
+      styles.push({ style, start: plainStart, length: innerText.length });
+
+      const stripped = fullMatch.length - innerText.length;
+      offset += stripped;
+      lastIndex = matchStart + fullMatch.length;
+    }
+
+    nextText.push(text.slice(lastIndex));
+    text = nextText.join('');
+  }
+
+  return { text, textStyles: styles };
 }
 
 function computeBackoff(attempt: number): number {

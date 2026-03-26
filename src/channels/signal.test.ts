@@ -789,6 +789,91 @@ describe('SignalChannel', () => {
     });
   });
 
+  // --- Text styles ---
+
+  describe('text styles', () => {
+    it('sends bold text with textStyle parameter', async () => {
+      const channel = createChannel();
+      await channel.connect();
+      mockFetch.mockClear();
+
+      await channel.sendMessage('signal:+15555550123', 'Hello **world**');
+
+      const rpcCall = mockFetch.mock.calls.find(
+        (c) => (c[0] as string).includes('/api/v1/rpc'),
+      );
+      expect(rpcCall).toBeDefined();
+      const body = JSON.parse(rpcCall![1]?.body as string);
+      expect(body.params.message).toBe('Hello world');
+      expect(body.params.textStyle).toEqual([
+        { style: 'BOLD', start: 6, length: 5 },
+      ]);
+
+      await channel.disconnect();
+    });
+
+    it('sends inline code with MONOSPACE style', async () => {
+      const channel = createChannel();
+      await channel.connect();
+      mockFetch.mockClear();
+
+      await channel.sendMessage('signal:+15555550123', 'Run `npm test` now');
+
+      const rpcCall = mockFetch.mock.calls.find(
+        (c) => (c[0] as string).includes('/api/v1/rpc'),
+      );
+      const body = JSON.parse(rpcCall![1]?.body as string);
+      expect(body.params.message).toBe('Run npm test now');
+      expect(body.params.textStyle).toEqual([
+        { style: 'MONOSPACE', start: 4, length: 8 },
+      ]);
+
+      await channel.disconnect();
+    });
+
+    it('sends plain text without textStyle parameter', async () => {
+      const channel = createChannel();
+      await channel.connect();
+      mockFetch.mockClear();
+
+      await channel.sendMessage('signal:+15555550123', 'No formatting here');
+
+      const rpcCall = mockFetch.mock.calls.find(
+        (c) => (c[0] as string).includes('/api/v1/rpc'),
+      );
+      const body = JSON.parse(rpcCall![1]?.body as string);
+      expect(body.params.message).toBe('No formatting here');
+      expect(body.params.textStyle).toBeUndefined();
+
+      await channel.disconnect();
+    });
+
+    it('handles multiple styles in one message', async () => {
+      const channel = createChannel();
+      await channel.connect();
+      mockFetch.mockClear();
+
+      await channel.sendMessage(
+        'signal:+15555550123',
+        '**Bold** and _italic_',
+      );
+
+      const rpcCall = mockFetch.mock.calls.find(
+        (c) => (c[0] as string).includes('/api/v1/rpc'),
+      );
+      const body = JSON.parse(rpcCall![1]?.body as string);
+      expect(body.params.message).toBe('Bold and italic');
+      expect(body.params.textStyle).toEqual(
+        expect.arrayContaining([
+          { style: 'BOLD', start: 0, length: 4 },
+          { style: 'ITALIC', start: 9, length: 6 },
+        ]),
+      );
+
+      await channel.disconnect();
+    });
+  });
+
   // --- Channel properties ---
 
   describe('channel properties', () => {
