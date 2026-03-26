@@ -347,6 +347,16 @@ export class SignalChannel implements Channel {
       logger.debug('Signal: could not set profile name');
     }
 
+    // Enable typing indicators so recipients see "composing" status
+    try {
+      await signalRpc(this.baseUrl, 'updateConfiguration', {
+        typingIndicators: true,
+        account: this.account,
+      });
+    } catch {
+      logger.debug('Signal: could not enable typing indicators');
+    }
+
     // Start SSE event loop
     this.connected = true;
     this.sseAbort = new AbortController();
