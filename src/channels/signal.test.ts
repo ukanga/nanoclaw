@@ -850,10 +850,7 @@ describe('SignalChannel', () => {
       await channel.connect();
       mockFetch.mockClear();
 
-      await channel.sendMessage(
-        'signal:+15555550123',
-        '**Bold** and _italic_',
-      );
+      await channel.sendMessage('signal:+15555550123', '**Bold** and _italic_');
 
       const rpcCall = mockFetch.mock.calls.find((c) =>
         (c[0] as string).includes('/api/v1/rpc'),
@@ -1012,7 +1009,10 @@ describe('SignalChannel', () => {
             callCount++;
             if (callCount === 1) {
               // Simulate timeout (AbortError) — message was likely already delivered
-              throw new DOMException('This operation was aborted', 'AbortError');
+              throw new DOMException(
+                'This operation was aborted',
+                'AbortError',
+              );
             }
             // Should never reach here
             const body = JSON.parse(init?.body as string);
