@@ -89,7 +89,7 @@ function spawnSignalDaemon(
 // HTTP JSON-RPC client for signal-cli daemon
 // ---------------------------------------------------------------------------
 
-const RPC_TIMEOUT_MS = 15_000;
+const RPC_TIMEOUT_MS = 30_000;
 
 async function signalRpc<T = unknown>(
   baseUrl: string,
@@ -296,6 +296,7 @@ export class SignalChannel implements Channel {
   private sseAbort: AbortController | null = null;
   private connected = false;
   private echoCache = new EchoCache();
+  private recentSends = new Map<string, number>();
   private baseUrl: string;
 
   constructor(
@@ -392,6 +393,24 @@ export class SignalChannel implements Channel {
 
     this.echoCache.remember(outText);
 
+    // Deduplicate: skip if the same text was sent to the same JID recently.
+    // This prevents double-sends when both streaming output and IPC send_message
+    // fire for the same agent response, or when the styled-send retry triggers
+    // after the first send already delivered the message.
+    const DEDUP_TTL_MS = 5_000;
+    const dedupeKey = `${jid}:${outText.trim()}`;
+    const now = Date.now();
+    const lastSent = this.recentSends.get(dedupeKey);
+    if (lastSent && now - lastSent < DEDUP_TTL_MS) {
+      logger.debug({ jid }, 'Signal: skipping duplicate outbound message');
+      return;
+    }
+    this.recentSends.set(dedupeKey, now);
+    // Prune stale entries
+    for (const [key, ts] of this.recentSends) {
+      if (now - ts > DEDUP_TTL_MS) this.recentSends.delete(key);
+    }
+
     // Split long messages
     const MAX_CHUNK = 4000;
     const chunks =
@@ -418,11 +437,19 @@ export class SignalChannel implements Channel {
         try {
           await signalRpc(this.baseUrl, 'send', params);
         } catch (styledErr) {
-          // Older signal-cli may not support textStyle — retry with original markup
-          if (textStyles.length > 0) {
-            logger.debug('Signal: textStyle rejected, retrying with markup');
+          // Only retry without styles when the error clearly indicates
+          // textStyle is unsupported (older signal-cli). Do NOT retry on
+          // timeouts or network errors — signal-cli may have already
+          // delivered the message, and retrying would send a duplicate.
+          const errMsg = styledErr instanceof Error ? styledErr.message : '';
+          const isTextStyleRejection =
+            textStyles.length > 0 &&
+            (errMsg.includes('textStyle') ||
+              errMsg.includes('Unknown parameter'));
+          if (isTextStyleRejection) {
+            logger.debug('Signal: textStyle rejected, retrying without styles');
             delete params.textStyle;
-            params.message = chunk;
+            params.message = plainText;
             await signalRpc(this.baseUrl, 'send', params);
           } else {
             throw styledErr;
@@ -728,6 +755,12 @@ interface StyledText {
 function parseSignalStyles(input: string): StyledText {
   const styles: SignalTextStyle[] = [];
 
+  // Pre-process: convert Markdown headings to bold (Signal has no heading support)
+  // and strip HTML tags that agents sometimes include
+  let preprocessed = input
+    .replace(/^#{1,6}\s+(.+)$/gm, '**$1**')
+    .replace(/<[^>]+>/g, '');
+
   // Process code blocks first (``` ... ```) to prevent inner markup parsing
   // Then inline patterns: **bold**, *bold*, _italic_, ~~strike~~, `mono`
   const patterns: Array<{
@@ -742,7 +775,7 @@ function parseSignalStyles(input: string): StyledText {
     { regex: /~~(.+?)~~/g, style: 'STRIKETHROUGH' },
   ];
 
-  let text = input;
+  let text = preprocessed;
 
   for (const { regex, style } of patterns) {
     const nextText: string[] = [];
