@@ -260,6 +260,27 @@ docker run --rm --entrypoint /bin/bash nanoclaw-agent:latest -c '
 '
 ```
 
+## Bloated Session / UND_ERR_SOCKET Recovery
+
+**Symptom:** A specific group repeatedly responds with `API Error: Unable to connect to API (UND_ERR_SOCKET)` while other groups in the same NanoClaw instance respond normally. New container generations keep hitting the same error.
+
+**Root cause:** The Claude Agent SDK resumes the stored `session_id` on every container run. After many turns, the resume transcript becomes large enough that the API connection (undici) fails with a socket error. Network is fine — the session is just too big to resume.
+
+**Quick check** (compare sessions across groups, then look at the wedged container's logs):
+
+```bash
+sqlite3 store/messages.db "SELECT group_folder, session_id FROM sessions;"
+docker logs --tail 50 nanoclaw-{group}-{timestamp} 2>&1 | grep -iE 'UND_ERR_SOCKET|API Error'
+```
+
+**Recovery:**
+
+```bash
+./scripts/reset-group-session.sh <group-folder>
+```
+
+The script deletes the SQLite session row and stops any running container for that group. The next message starts a fresh session. On-disk session history under `data/sessions/{group}/.claude/projects/` is preserved; only NanoClaw's pointer is reset, so forensics are still possible.
+
 ## Session Persistence
 
 Claude sessions are stored per-group in `data/sessions/{group}/.claude/` for security isolation. Each group has its own session directory, preventing cross-group access to conversation history.
