@@ -1275,9 +1275,9 @@ describe('SignalChannel', () => {
       await new Promise((r) => setTimeout(r, 50));
 
       expect(opts.onMessage).not.toHaveBeenCalled();
-      expect(
-        fs.existsSync(path.join(inboxDir, '1700000002000-huge.mp4')),
-      ).toBe(false);
+      expect(fs.existsSync(path.join(inboxDir, '1700000002000-huge.mp4'))).toBe(
+        false,
+      );
 
       await channel.disconnect();
     });
@@ -1369,9 +1369,9 @@ describe('SignalChannel', () => {
       const [, msg] = lastOnMessageCall(opts);
       expect(msg.content).toBe('where is it');
       expect(msg.attachments).toBeUndefined();
-      expect(fs.existsSync(path.join(inboxDir, '1700000004000-ghost.png'))).toBe(
-        false,
-      );
+      expect(
+        fs.existsSync(path.join(inboxDir, '1700000004000-ghost.png')),
+      ).toBe(false);
 
       await channel.disconnect();
     });
@@ -1418,6 +1418,151 @@ describe('SignalChannel', () => {
       expect(msg.content).toBe(
         '> +15555550888: Can you send the file?\n\nSee attached\n[Attachment: /workspace/group/inbox/1700000005000-doc.pdf, application/pdf, 6 B]',
       );
+
+      await channel.disconnect();
+    });
+  });
+
+  // --- Outbound attachments ---
+
+  describe('outbound attachments', () => {
+    let attachDir: string;
+
+    function makeFile(name: string, contents = 'data'): string {
+      const p = path.join(attachDir, name);
+      fs.writeFileSync(p, contents);
+      return p;
+    }
+
+    function lastSendPayload(): Record<string, unknown> {
+      const rpcCalls = mockFetch.mock.calls.filter((c) =>
+        String(c[0]).includes('/api/v1/rpc'),
+      );
+      const body = JSON.parse(
+        (rpcCalls[rpcCalls.length - 1][1] as RequestInit).body as string,
+      );
+      return body.params as Record<string, unknown>;
+    }
+
+    function allSendPayloads(): Record<string, unknown>[] {
+      return mockFetch.mock.calls
+        .filter((c) => String(c[0]).includes('/api/v1/rpc'))
+        .map((c) => {
+          const body = JSON.parse((c[1] as RequestInit).body as string);
+          return body.params as Record<string, unknown>;
+        });
+    }
+
+    beforeEach(() => {
+      attachDir = fs.mkdtempSync(
+        path.join(os.tmpdir(), 'signal-outbound-test-'),
+      );
+    });
+
+    afterEach(() => {
+      fs.rmSync(attachDir, { recursive: true, force: true });
+    });
+
+    it('forwards a single attachment to signal-cli send params', async () => {
+      const filePath = makeFile('report.pdf');
+      const channel = createChannel();
+      await channel.connect();
+
+      await channel.sendMessage('signal:+15555550123', 'Here it is', [filePath]);
+
+      const params = lastSendPayload();
+      expect(params.message).toBe('Here it is');
+      expect(params.attachments).toEqual([filePath]);
+
+      await channel.disconnect();
+    });
+
+    it('forwards multiple attachments in one send call', async () => {
+      const a = makeFile('a.pdf');
+      const b = makeFile('b.xlsx');
+      const channel = createChannel();
+      await channel.connect();
+
+      await channel.sendMessage('signal:+15555550123', 'Two files', [a, b]);
+
+      const params = lastSendPayload();
+      expect(params.attachments).toEqual([a, b]);
+
+      await channel.disconnect();
+    });
+
+    it('allows attachment-only messages (empty caption)', async () => {
+      const filePath = makeFile('silent.pdf');
+      const channel = createChannel();
+      await channel.connect();
+
+      await channel.sendMessage('signal:+15555550123', '', [filePath]);
+
+      const params = lastSendPayload();
+      expect(params.message).toBe('');
+      expect(params.attachments).toEqual([filePath]);
+
+      await channel.disconnect();
+    });
+
+    it('throws on non-existent attachment without sending', async () => {
+      const channel = createChannel();
+      await channel.connect();
+
+      const beforeCount = mockFetch.mock.calls.filter((c) =>
+        String(c[0]).includes('/api/v1/rpc'),
+      ).length;
+
+      await expect(
+        channel.sendMessage('signal:+15555550123', 'hi', [
+          path.join(attachDir, 'does-not-exist.pdf'),
+        ]),
+      ).rejects.toThrow(/attachment file not found/i);
+
+      const afterCount = mockFetch.mock.calls.filter((c) =>
+        String(c[0]).includes('/api/v1/rpc'),
+      ).length;
+      expect(afterCount).toBe(beforeCount);
+
+      await channel.disconnect();
+    });
+
+    it('throws on relative attachment path without sending', async () => {
+      const channel = createChannel();
+      await channel.connect();
+
+      const beforeCount = mockFetch.mock.calls.filter((c) =>
+        String(c[0]).includes('/api/v1/rpc'),
+      ).length;
+
+      await expect(
+        channel.sendMessage('signal:+15555550123', 'hi', ['relative.pdf']),
+      ).rejects.toThrow(/must be absolute/i);
+
+      const afterCount = mockFetch.mock.calls.filter((c) =>
+        String(c[0]).includes('/api/v1/rpc'),
+      ).length;
+      expect(afterCount).toBe(beforeCount);
+
+      await channel.disconnect();
+    });
+
+    it('attaches files only to the first chunk when text is split', async () => {
+      const filePath = makeFile('once.pdf');
+      const channel = createChannel();
+      await channel.connect();
+
+      // 4001 chars to force a 2-chunk split (MAX_CHUNK = 4000)
+      const longText = 'A'.repeat(4001);
+      await channel.sendMessage('signal:+15555550123', longText, [filePath]);
+
+      const sends = allSendPayloads();
+      // signal-cli was called at least twice (one per chunk) — guard against
+      // styled-send retries by filtering to non-retry payloads only.
+      const sendsForChunks = sends.filter((p) => 'recipient' in p);
+      expect(sendsForChunks.length).toBeGreaterThanOrEqual(2);
+      expect(sendsForChunks[0].attachments).toEqual([filePath]);
+      expect(sendsForChunks[1].attachments).toBeUndefined();
 
       await channel.disconnect();
     });
