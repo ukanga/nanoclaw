@@ -15,10 +15,13 @@ import {
   writeTasksSnapshot,
 } from './container-runner.js';
 import {
+  getAllSessions,
   getAllTasks,
   getDueTasks,
+  getRouterState,
   getTaskById,
   logTaskRun,
+  setRouterState,
   updateTask,
   updateTaskAfterRun,
 } from './db.js';
@@ -409,4 +412,148 @@ export function startAttachmentCleanupLoop(): void {
 /** @internal - for tests only. */
 export function _resetAttachmentCleanupForTests(): void {
   attachmentCleanupRunning = false;
+}
+
+// ---------------------------------------------------------------------------
+// Session size warnings (heads-up to main group when a session is heavy)
+// ---------------------------------------------------------------------------
+
+const COMPACT_WARNING_INTERVAL_MS = 24 * 60 * 60 * 1000;
+const COMPACT_WARNING_INITIAL_DELAY_MS = 90_000;
+const COMPACT_WARNING_SUPPRESSION_MS = 7 * 24 * 60 * 60 * 1000;
+const COMPACT_WARNING_DEFAULT_THRESHOLD_BYTES = 500_000;
+
+function getCompactWarningThresholdBytes(): number {
+  const raw = process.env.AUTO_COMPACT_THRESHOLD_BYTES;
+  const n = raw ? parseInt(raw, 10) : COMPACT_WARNING_DEFAULT_THRESHOLD_BYTES;
+  return Number.isFinite(n) && n > 0
+    ? n
+    : COMPACT_WARNING_DEFAULT_THRESHOLD_BYTES;
+}
+
+function getProjectRoot(): string {
+  return process.env.NANOCLAW_PROJECT_ROOT ?? process.cwd();
+}
+
+function sessionFilePath(folder: string, sessionId: string): string {
+  return path.join(
+    getProjectRoot(),
+    'data',
+    'sessions',
+    folder,
+    '.claude',
+    'projects',
+    '-workspace-group',
+    `${sessionId}.jsonl`,
+  );
+}
+
+export interface SessionWarningDeps {
+  registeredGroups: () => Record<string, RegisteredGroup>;
+  sendMessage: (jid: string, text: string) => Promise<void>;
+  /** Optional clock injection for tests. */
+  now?: () => number;
+}
+
+interface HeavySession {
+  folder: string;
+  bytes: number;
+  tokensK: number;
+}
+
+function formatBytes(n: number): string {
+  if (n < 1024) return `${n} B`;
+  if (n < 1024 * 1024) return `${Math.round(n / 1024)} KB`;
+  return `${(n / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+/**
+ * Scan every group's session jsonl. For each one over the threshold AND
+ * not warned in the last 7 days, post a single bundled heads-up to the
+ * main group. Stays silent when nothing exceeds the threshold.
+ */
+export async function runSessionWarning(
+  deps: SessionWarningDeps,
+): Promise<void> {
+  const groups = deps.registeredGroups();
+  const mainEntry = Object.entries(groups).find(([, g]) => g.isMain);
+  if (!mainEntry) {
+    logger.debug('Session warning: no main group registered, skipping');
+    return;
+  }
+  const [mainJid] = mainEntry;
+
+  const sessions = getAllSessions();
+  const threshold = getCompactWarningThresholdBytes();
+  const now = (deps.now ?? Date.now)();
+  const heavy: HeavySession[] = [];
+
+  for (const [folder, sessionId] of Object.entries(sessions)) {
+    const file = sessionFilePath(folder, sessionId);
+    if (!fs.existsSync(file)) continue;
+    let stat;
+    try {
+      stat = fs.statSync(file);
+    } catch {
+      continue;
+    }
+    if (stat.size < threshold) continue;
+
+    const lastWarnedRaw = getRouterState(`compact_warning_seen:${folder}`);
+    const lastWarned = lastWarnedRaw ? parseInt(lastWarnedRaw, 10) : 0;
+    if (now - lastWarned < COMPACT_WARNING_SUPPRESSION_MS) continue;
+
+    heavy.push({
+      folder,
+      bytes: stat.size,
+      tokensK: Math.floor(stat.size / 4 / 1024),
+    });
+  }
+
+  if (heavy.length === 0) return;
+
+  const lines = heavy.map(
+    (h) => `• ${h.folder}: ${formatBytes(h.bytes)} (~${h.tokensK}K tokens)`,
+  );
+  const msg = `Heads up — these sessions are getting heavy and may slow down or fail with UND_ERR_SOCKET:\n${lines.join('\n')}\n\nTo compact, mention @${ASSISTANT_NAME} /compact in the relevant group, or run ./scripts/reset-group-session.sh <folder> for a hard reset. Suppressing further warnings for these groups for 7 days.`;
+
+  try {
+    await deps.sendMessage(mainJid, msg);
+    for (const h of heavy) {
+      setRouterState(`compact_warning_seen:${h.folder}`, String(now));
+    }
+    logger.info(
+      { mainJid, heavy: heavy.map((h) => h.folder) },
+      'Session warning sent',
+    );
+  } catch (err) {
+    logger.error({ err }, 'Session warning failed');
+  }
+}
+
+let sessionWarningRunning = false;
+
+export function startSessionWarningLoop(deps: SessionWarningDeps): void {
+  if (sessionWarningRunning) {
+    logger.debug('Session warning loop already running');
+    return;
+  }
+  sessionWarningRunning = true;
+  logger.info('Session warning loop started');
+
+  const tick = async () => {
+    try {
+      await runSessionWarning(deps);
+    } catch (err) {
+      logger.error({ err }, 'Session warning loop error');
+    }
+    setTimeout(tick, COMPACT_WARNING_INTERVAL_MS);
+  };
+
+  setTimeout(tick, COMPACT_WARNING_INITIAL_DELAY_MS);
+}
+
+/** @internal - for tests only. */
+export function _resetSessionWarningForTests(): void {
+  sessionWarningRunning = false;
 }

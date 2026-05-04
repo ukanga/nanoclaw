@@ -3,11 +3,20 @@ import * as os from 'node:os';
 import * as path from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-import { _initTestDatabase, createTask, getTaskById } from './db.js';
+import {
+  _initTestDatabase,
+  createTask,
+  getRouterState,
+  getTaskById,
+  setRouterState,
+  setRegisteredGroup,
+  setSession,
+} from './db.js';
 import {
   _resetSchedulerLoopForTests,
   computeNextRun,
   runAttachmentCleanup,
+  runSessionWarning,
   startSchedulerLoop,
 } from './task-scheduler.js';
 
@@ -200,5 +209,198 @@ describe('runAttachmentCleanup', () => {
     delete process.env.NANOCLAW_GROUPS_DIR;
     process.env.NANOCLAW_GROUPS_DIR = path.join(groupsDir, 'does-not-exist');
     await expect(runAttachmentCleanup()).resolves.toBeUndefined();
+  });
+});
+
+describe('runSessionWarning', () => {
+  let projectRoot: string;
+  const mainJid = 'signal:main';
+  const heavyFolder = 'team-heavy';
+  const lightFolder = 'team-light';
+
+  function writeSession(
+    folder: string,
+    sessionId: string,
+    bytes: number,
+  ): void {
+    const dir = path.join(
+      projectRoot,
+      'data',
+      'sessions',
+      folder,
+      '.claude',
+      'projects',
+      '-workspace-group',
+    );
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(path.join(dir, `${sessionId}.jsonl`), 'x'.repeat(bytes));
+  }
+
+  beforeEach(() => {
+    _initTestDatabase();
+    projectRoot = fs.mkdtempSync(
+      path.join(os.tmpdir(), 'session-warning-test-'),
+    );
+    process.env.NANOCLAW_PROJECT_ROOT = projectRoot;
+    delete process.env.AUTO_COMPACT_THRESHOLD_BYTES;
+    setRegisteredGroup(mainJid, {
+      name: 'Main',
+      folder: 'main',
+      trigger: '@Andy',
+      added_at: '2024-01-01T00:00:00.000Z',
+      isMain: true,
+    });
+  });
+
+  afterEach(() => {
+    delete process.env.NANOCLAW_PROJECT_ROOT;
+    delete process.env.AUTO_COMPACT_THRESHOLD_BYTES;
+    fs.rmSync(projectRoot, { recursive: true, force: true });
+  });
+
+  it('warns the main group about heavy sessions and records suppression', async () => {
+    setSession(heavyFolder, 'sess-heavy');
+    setSession(lightFolder, 'sess-light');
+    writeSession(heavyFolder, 'sess-heavy', 600_000);
+    writeSession(lightFolder, 'sess-light', 50_000);
+
+    const sendMessage = vi.fn(async () => {});
+    await runSessionWarning({
+      registeredGroups: () => ({
+        [mainJid]: {
+          name: 'Main',
+          folder: 'main',
+          trigger: '@Andy',
+          added_at: '2024-01-01T00:00:00.000Z',
+          isMain: true,
+        },
+      }),
+      sendMessage,
+      now: () => 1_700_000_000_000,
+    });
+
+    expect(sendMessage).toHaveBeenCalledTimes(1);
+    const call = sendMessage.mock.calls[0] as unknown as [string, string];
+    expect(call[0]).toBe(mainJid);
+    expect(call[1]).toContain(heavyFolder);
+    expect(call[1]).not.toContain(lightFolder);
+    expect(call[1]).toMatch(/\/compact/);
+
+    expect(getRouterState(`compact_warning_seen:${heavyFolder}`)).toBe(
+      '1700000000000',
+    );
+    expect(
+      getRouterState(`compact_warning_seen:${lightFolder}`),
+    ).toBeFalsy();
+  });
+
+  it('suppresses repeat warnings within 7 days', async () => {
+    setSession(heavyFolder, 'sess-heavy');
+    writeSession(heavyFolder, 'sess-heavy', 600_000);
+    setRouterState(
+      `compact_warning_seen:${heavyFolder}`,
+      String(1_700_000_000_000 - 24 * 60 * 60 * 1000),
+    );
+
+    const sendMessage = vi.fn(async () => {});
+    await runSessionWarning({
+      registeredGroups: () => ({
+        [mainJid]: {
+          name: 'Main',
+          folder: 'main',
+          trigger: '@Andy',
+          added_at: '2024-01-01T00:00:00.000Z',
+          isMain: true,
+        },
+      }),
+      sendMessage,
+      now: () => 1_700_000_000_000,
+    });
+
+    expect(sendMessage).not.toHaveBeenCalled();
+  });
+
+  it('warns again after suppression window expires', async () => {
+    setSession(heavyFolder, 'sess-heavy');
+    writeSession(heavyFolder, 'sess-heavy', 600_000);
+    const eightDaysAgo = 1_700_000_000_000 - 8 * 24 * 60 * 60 * 1000;
+    setRouterState(
+      `compact_warning_seen:${heavyFolder}`,
+      String(eightDaysAgo),
+    );
+
+    const sendMessage = vi.fn(async () => {});
+    await runSessionWarning({
+      registeredGroups: () => ({
+        [mainJid]: {
+          name: 'Main',
+          folder: 'main',
+          trigger: '@Andy',
+          added_at: '2024-01-01T00:00:00.000Z',
+          isMain: true,
+        },
+      }),
+      sendMessage,
+      now: () => 1_700_000_000_000,
+    });
+
+    expect(sendMessage).toHaveBeenCalledTimes(1);
+  });
+
+  it('respects AUTO_COMPACT_THRESHOLD_BYTES override', async () => {
+    process.env.AUTO_COMPACT_THRESHOLD_BYTES = '100000';
+    setSession(heavyFolder, 'sess-heavy');
+    writeSession(heavyFolder, 'sess-heavy', 200_000);
+
+    const sendMessage = vi.fn(async () => {});
+    await runSessionWarning({
+      registeredGroups: () => ({
+        [mainJid]: {
+          name: 'Main',
+          folder: 'main',
+          trigger: '@Andy',
+          added_at: '2024-01-01T00:00:00.000Z',
+          isMain: true,
+        },
+      }),
+      sendMessage,
+      now: () => 1_700_000_000_000,
+    });
+
+    expect(sendMessage).toHaveBeenCalledTimes(1);
+  });
+
+  it('stays silent when no session exceeds the threshold', async () => {
+    setSession(lightFolder, 'sess-light');
+    writeSession(lightFolder, 'sess-light', 10_000);
+
+    const sendMessage = vi.fn(async () => {});
+    await runSessionWarning({
+      registeredGroups: () => ({
+        [mainJid]: {
+          name: 'Main',
+          folder: 'main',
+          trigger: '@Andy',
+          added_at: '2024-01-01T00:00:00.000Z',
+          isMain: true,
+        },
+      }),
+      sendMessage,
+    });
+
+    expect(sendMessage).not.toHaveBeenCalled();
+  });
+
+  it('skips when no main group is registered', async () => {
+    setSession(heavyFolder, 'sess-heavy');
+    writeSession(heavyFolder, 'sess-heavy', 600_000);
+
+    const sendMessage = vi.fn(async () => {});
+    await runSessionWarning({
+      registeredGroups: () => ({}),
+      sendMessage,
+    });
+
+    expect(sendMessage).not.toHaveBeenCalled();
   });
 });
