@@ -366,9 +366,7 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
           ? result.result
           : JSON.stringify(result.result);
       // Strip <internal>...</internal> blocks — agent uses these for internal reasoning
-      const cleaned = raw
-        .replace(/<internal>[\s\S]*?<\/internal>/g, '')
-        .trim();
+      const cleaned = raw.replace(/<internal>[\s\S]*?<\/internal>/g, '').trim();
       logger.info({ group: group.name }, `Agent output: ${raw.length} chars`);
       // Translate any [[attach:/workspace/group/...]] markers into Signal
       // attachments before sending so the agent can ship files alongside text.
@@ -799,7 +797,6 @@ async function main(): Promise<void> {
     logger.fatal('No channels connected');
     process.exit(1);
   }
-
 
   // Start subsystems (independently of connection handler)
   startSchedulerLoop({
