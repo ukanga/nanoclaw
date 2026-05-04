@@ -497,7 +497,11 @@ export class SignalChannel implements Channel {
     );
   }
 
-  async sendMessage(jid: string, text: string): Promise<void> {
+  async sendMessage(
+    jid: string,
+    text: string,
+    attachments?: string[],
+  ): Promise<void> {
     if (!this.connected) {
       logger.warn('Signal: not connected, cannot send');
       return;
@@ -507,6 +511,20 @@ export class SignalChannel implements Channel {
     if (!target) {
       logger.warn({ jid }, 'Signal: empty target');
       return;
+    }
+
+    // Validate attachment paths up-front so we fail before any network call.
+    const attachmentPaths: string[] = [];
+    if (attachments && attachments.length > 0) {
+      for (const p of attachments) {
+        if (!path.isAbsolute(p)) {
+          throw new Error(`Signal: attachment path must be absolute: ${p}`);
+        }
+        if (!fs.existsSync(p)) {
+          throw new Error(`Signal: attachment file not found: ${p}`);
+        }
+        attachmentPaths.push(p);
+      }
     }
 
     // Prefix with assistant name when sharing an account (Note to Self)
@@ -540,7 +558,8 @@ export class SignalChannel implements Channel {
     const chunks =
       outText.length <= MAX_CHUNK ? [outText] : chunkText(outText, MAX_CHUNK);
 
-    for (const chunk of chunks) {
+    for (let i = 0; i < chunks.length; i++) {
+      const chunk = chunks[i];
       try {
         const { text: plainText, textStyles } = parseSignalStyles(chunk);
         const params: Record<string, unknown> = { message: plainText };
@@ -550,6 +569,11 @@ export class SignalChannel implements Channel {
           params.textStyle = textStyles.map(
             (s) => `${s.start}:${s.length}:${s.style}`,
           );
+        }
+
+        // Attach files only to the first chunk to avoid duplicate uploads.
+        if (i === 0 && attachmentPaths.length > 0) {
+          params.attachments = attachmentPaths;
         }
 
         if (target.startsWith('group:')) {
