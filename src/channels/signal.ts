@@ -3,21 +3,132 @@ import {
   spawn,
   type ChildProcessWithoutNullStreams,
 } from 'node:child_process';
+import * as fs from 'node:fs';
+import * as os from 'node:os';
+import * as path from 'node:path';
 
 import {
   ASSISTANT_HAS_OWN_NUMBER,
   ASSISTANT_NAME,
+  GROUPS_DIR,
   TRIGGER_PATTERN,
 } from '../config.js';
 import { readEnvFile } from '../env.js';
 import { logger } from '../logger.js';
 import { registerChannel, type ChannelOpts } from './registry.js';
 import type {
+  AttachmentMeta,
   Channel,
   OnChatMetadata,
   OnInboundMessage,
   RegisteredGroup,
 } from '../types.js';
+
+const MAX_ATTACHMENT_BYTES = 25 * 1024 * 1024;
+const AGENT_INBOX_PREFIX = '/workspace/group/inbox';
+const CONTENT_TYPE_EXT: Record<string, string> = {
+  'image/png': '.png',
+  'image/jpeg': '.jpg',
+  'image/gif': '.gif',
+  'image/webp': '.webp',
+  'application/pdf': '.pdf',
+  'audio/mpeg': '.mp3',
+  'audio/aac': '.aac',
+  'audio/ogg': '.ogg',
+  'video/mp4': '.mp4',
+};
+
+function getSignalAttachmentsCacheDir(): string {
+  return (
+    process.env.SIGNAL_ATTACHMENTS_DIR ??
+    path.join(os.homedir(), '.local', 'share', 'signal-cli', 'attachments')
+  );
+}
+
+function sanitizeAttachmentName(
+  filename: string | undefined,
+  fallbackId: string,
+  contentType: string | undefined,
+): string {
+  const base = path.basename((filename ?? '').trim());
+  const cleaned = base.replace(/[^A-Za-z0-9._-]/g, '_').replace(/_+/g, '_');
+  if (!cleaned || /^[._]+$/.test(cleaned)) {
+    const ext = contentType ? (CONTENT_TYPE_EXT[contentType] ?? '') : '';
+    return `attachment-${fallbackId}${ext}`;
+  }
+  return cleaned;
+}
+
+function findCachedAttachment(cacheDir: string, id: string): string | null {
+  const direct = path.join(cacheDir, id);
+  if (fs.existsSync(direct)) return direct;
+  try {
+    const match = fs
+      .readdirSync(cacheDir)
+      .find((f) => f === id || f.startsWith(`${id}.`));
+    if (match) return path.join(cacheDir, match);
+  } catch {
+    /* unreadable cache dir */
+  }
+  return null;
+}
+
+function materializeAttachments(
+  attachments: SignalAttachment[],
+  groupFolder: string,
+  msgTimestamp: number,
+): AttachmentMeta[] {
+  const cacheDir = getSignalAttachmentsCacheDir();
+  const inboxDir = path.join(GROUPS_DIR, groupFolder, 'inbox');
+  const result: AttachmentMeta[] = [];
+
+  for (const att of attachments) {
+    if (!att.id) continue;
+
+    const size = att.size ?? 0;
+    if (size > MAX_ATTACHMENT_BYTES) {
+      logger.warn(
+        { id: att.id, size, max: MAX_ATTACHMENT_BYTES },
+        'Signal: skipping oversize attachment',
+      );
+      continue;
+    }
+
+    const src = findCachedAttachment(cacheDir, att.id);
+    if (!src) {
+      logger.warn(
+        { id: att.id, cacheDir },
+        'Signal: attachment cache file missing, skipping',
+      );
+      continue;
+    }
+
+    const sanitized = sanitizeAttachmentName(
+      att.filename,
+      att.id,
+      att.contentType,
+    );
+    const destName = `${msgTimestamp}-${sanitized}`;
+    const destPath = path.join(inboxDir, destName);
+
+    try {
+      fs.mkdirSync(inboxDir, { recursive: true });
+      fs.copyFileSync(src, destPath);
+    } catch (err) {
+      logger.warn({ err, src, destPath }, 'Signal: failed to copy attachment');
+      continue;
+    }
+
+    result.push({
+      path: `${AGENT_INBOX_PREFIX}/${destName}`,
+      contentType: att.contentType ?? 'application/octet-stream',
+      filename: att.filename ?? sanitized,
+      size,
+    });
+  }
+
+  return result;
+}
 
 // ---------------------------------------------------------------------------
 // Signal CLI daemon management
@@ -250,17 +361,19 @@ interface SignalQuote {
   text?: string;
 }
 
+interface SignalAttachment {
+  id?: string;
+  contentType?: string;
+  filename?: string;
+  size?: number;
+}
+
 interface SignalDataMessage {
   timestamp?: number;
   message?: string;
   groupInfo?: { groupId?: string; groupName?: string; type?: string };
   quote?: SignalQuote;
-  attachments?: Array<{
-    id?: string;
-    contentType?: string;
-    filename?: string;
-    size?: number;
-  }>;
+  attachments?: SignalAttachment[];
 }
 
 interface SignalEnvelope {
@@ -628,7 +741,8 @@ export class SignalChannel implements Channel {
     if (!dataMessage) return;
 
     const text = (dataMessage.message ?? '').trim();
-    if (!text) return;
+    const hasAttachments = Boolean(dataMessage.attachments?.length);
+    if (!text && !hasAttachments) return;
 
     // Determine sender
     const sender = (envelope.sourceNumber ?? envelope.source ?? '').trim();
@@ -670,6 +784,16 @@ export class SignalChannel implements Channel {
       return;
     }
 
+    // Materialize attachments into the group's inbox so the agent can read them
+    let materializedAttachments: AttachmentMeta[] = [];
+    if (dataMessage.attachments && dataMessage.attachments.length > 0) {
+      materializedAttachments = materializeAttachments(
+        dataMessage.attachments,
+        group.folder,
+        dataMessage.timestamp ?? Date.now(),
+      );
+    }
+
     let content = text;
 
     // Prepend quote context so the agent sees what's being replied to
@@ -698,9 +822,18 @@ export class SignalChannel implements Channel {
       content,
       timestamp,
       is_from_me: false,
+      attachments:
+        materializedAttachments.length > 0 ? materializedAttachments : undefined,
     });
 
-    logger.info({ chatJid, sender: senderName }, 'Signal message stored');
+    logger.info(
+      {
+        chatJid,
+        sender: senderName,
+        attachmentCount: materializedAttachments.length,
+      },
+      'Signal message stored',
+    );
   }
 }
 
