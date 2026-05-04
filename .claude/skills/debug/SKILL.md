@@ -269,9 +269,11 @@ docker run --rm --entrypoint /bin/bash nanoclaw-agent:latest -c '
 **Quick check** (compare sessions across groups, then look at the wedged container's logs):
 
 ```bash
-sqlite3 store/messages.db "SELECT group_folder, session_id FROM sessions;"
+./scripts/group-context-size.sh
 docker logs --tail 50 nanoclaw-{group}-{timestamp} 2>&1 | grep -iE 'UND_ERR_SOCKET|API Error'
 ```
+
+`group-context-size.sh` prints lines / bytes / token-estimate per group, sorted by size descending. Rough thresholds: under 200 K tokens stays snappy; 200–500 K resumes get sluggish; >500 K is the territory where `UND_ERR_SOCKET` becomes likely.
 
 **Recovery:**
 
