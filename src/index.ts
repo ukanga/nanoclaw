@@ -4,6 +4,7 @@ import path from 'path';
 import { OneCLI } from '@onecli-sh/sdk';
 
 import {
+  ADMIN_SENDERS,
   ASSISTANT_NAME,
   DEFAULT_TRIGGER,
   getTriggerPattern,
@@ -258,6 +259,7 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
     groupName: group.name,
     triggerPattern: getTriggerPattern(group.trigger),
     timezone: TIMEZONE,
+    adminSenders: ADMIN_SENDERS,
     deps: {
       sendMessage: (text) => channel.sendMessage(chatJid, text),
       setTyping: (typing) =>
@@ -535,6 +537,7 @@ async function startMessageLoop(): Promise<void> {
               isSessionCommandAllowed(
                 isMainGroup,
                 loopCmdMsg.is_from_me === true,
+                Boolean(loopCmdMsg.sender && ADMIN_SENDERS.has(loopCmdMsg.sender)),
               )
             ) {
               queue.closeStdin(chatJid);

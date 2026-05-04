@@ -8,6 +8,7 @@ import { isValidTimezone } from './timezone.js';
 const envConfig = readEnvFile([
   'ASSISTANT_NAME',
   'ASSISTANT_HAS_OWN_NUMBER',
+  'ADMIN_SENDERS',
   'ONECLI_URL',
   'TZ',
 ]);
@@ -17,6 +18,19 @@ export const ASSISTANT_NAME =
 export const ASSISTANT_HAS_OWN_NUMBER =
   (process.env.ASSISTANT_HAS_OWN_NUMBER ||
     envConfig.ASSISTANT_HAS_OWN_NUMBER) === 'true';
+/**
+ * Senders authorized to run session commands (e.g. /compact) from any group.
+ * Comma- or whitespace-separated. Match is exact against the channel's
+ * sender field (e.g. Signal phone numbers like "+254720395121").
+ * Useful when the assistant runs on its own number, so is_from_me is never
+ * set for the operator's own messages.
+ */
+export const ADMIN_SENDERS: ReadonlySet<string> = new Set(
+  (process.env.ADMIN_SENDERS || envConfig.ADMIN_SENDERS || '')
+    .split(/[,\s]+/)
+    .map((s) => s.trim())
+    .filter(Boolean),
+);
 export const POLL_INTERVAL = 2000;
 export const SCHEDULER_POLL_INTERVAL = 60000;
 
