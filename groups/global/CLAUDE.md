@@ -47,7 +47,7 @@ Look at this
 [Attachment: /workspace/group/inbox/1700000000000-budget.pdf, application/pdf, 412 KB]
 ```
 
-Open the file with the standard `Read` tool — the path in the marker is what to read.
+Open the file with the standard `Read` tool — the path in the marker is what to read. `Read` handles PNG, JPG, PDF, and Jupyter notebooks natively (vision); you can decode QR codes, screenshots, charts, scanned docs, etc. directly without Bash CLI tools. Don't go hunting for `zbarimg`, `pyzbar`, OCR utilities, or external services — `Read` is enough.
 
 To send a file back, write it under `/workspace/group/outbox/` and reference it in your reply with a `[[attach:...]]` token. Tokens are stripped from the visible text and the file is sent as a Signal attachment:
 
