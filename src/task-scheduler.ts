@@ -457,7 +457,8 @@ export interface SessionWarningDeps {
 
 interface HeavySession {
   folder: string;
-  bytes: number;
+  totalBytes: number;
+  liveBytes: number;
   tokensK: number;
 }
 
@@ -465,6 +466,21 @@ function formatBytes(n: number): string {
   if (n < 1024) return `${n} B`;
   if (n < 1024 * 1024) return `${Math.round(n / 1024)} KB`;
   return `${(n / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+/**
+ * Live (post-compact) bytes — what the SDK actually loads on resume.
+ * The SDK only feeds content from the last `compact_boundary` marker
+ * onward to the model; pre-boundary turns stay in the jsonl for
+ * forensics. Returns the full file size when no boundary is present.
+ */
+export function liveSessionBytes(file: string, totalBytes: number): number {
+  const content = fs.readFileSync(file, 'utf-8');
+  const idx = content.lastIndexOf('"subtype":"compact_boundary"');
+  if (idx === -1) return totalBytes;
+  const newlineAfterBoundary = content.indexOf('\n', idx);
+  if (newlineAfterBoundary === -1) return 0;
+  return Buffer.byteLength(content.slice(newlineAfterBoundary + 1), 'utf-8');
 }
 
 /**
@@ -491,13 +507,18 @@ export async function runSessionWarning(
   for (const [folder, sessionId] of Object.entries(sessions)) {
     const file = sessionFilePath(folder, sessionId);
     if (!fs.existsSync(file)) continue;
-    let stat;
+    let totalBytes: number;
+    let liveBytes: number;
     try {
-      stat = fs.statSync(file);
+      totalBytes = fs.statSync(file).size;
+      liveBytes = liveSessionBytes(file, totalBytes);
     } catch {
       continue;
     }
-    if (stat.size < threshold) continue;
+    // Threshold is checked against LIVE bytes — what the model actually
+    // sees on resume — so a 3.5 MB compacted session with 22 KB live no
+    // longer trips the warning.
+    if (liveBytes < threshold) continue;
 
     const lastWarnedRaw = getRouterState(`compact_warning_seen:${folder}`);
     const lastWarned = lastWarnedRaw ? parseInt(lastWarnedRaw, 10) : 0;
@@ -505,16 +526,21 @@ export async function runSessionWarning(
 
     heavy.push({
       folder,
-      bytes: stat.size,
-      tokensK: Math.floor(stat.size / 4 / 1024),
+      totalBytes,
+      liveBytes,
+      tokensK: Math.floor(liveBytes / 4 / 1024),
     });
   }
 
   if (heavy.length === 0) return;
 
-  const lines = heavy.map(
-    (h) => `• ${h.folder}: ${formatBytes(h.bytes)} (~${h.tokensK}K tokens)`,
-  );
+  const lines = heavy.map((h) => {
+    const sizes =
+      h.liveBytes < h.totalBytes
+        ? `${formatBytes(h.liveBytes)} live / ${formatBytes(h.totalBytes)} on disk`
+        : formatBytes(h.liveBytes);
+    return `• ${h.folder}: ${sizes} (~${h.tokensK}K tokens)`;
+  });
   const msg = `Heads up — these sessions are getting heavy and may slow down or fail with UND_ERR_SOCKET:\n${lines.join('\n')}\n\nTo compact, mention @${ASSISTANT_NAME} /compact in the relevant group, or run ./scripts/reset-group-session.sh <folder> for a hard reset. Suppressing further warnings for these groups for 7 days.`;
 
   try {

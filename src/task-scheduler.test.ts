@@ -15,6 +15,7 @@ import {
 import {
   _resetSchedulerLoopForTests,
   computeNextRun,
+  liveSessionBytes,
   runAttachmentCleanup,
   runSessionWarning,
   startSchedulerLoop,
@@ -289,9 +290,7 @@ describe('runSessionWarning', () => {
     expect(getRouterState(`compact_warning_seen:${heavyFolder}`)).toBe(
       '1700000000000',
     );
-    expect(
-      getRouterState(`compact_warning_seen:${lightFolder}`),
-    ).toBeFalsy();
+    expect(getRouterState(`compact_warning_seen:${lightFolder}`)).toBeFalsy();
   });
 
   it('suppresses repeat warnings within 7 days', async () => {
@@ -324,10 +323,7 @@ describe('runSessionWarning', () => {
     setSession(heavyFolder, 'sess-heavy');
     writeSession(heavyFolder, 'sess-heavy', 600_000);
     const eightDaysAgo = 1_700_000_000_000 - 8 * 24 * 60 * 60 * 1000;
-    setRouterState(
-      `compact_warning_seen:${heavyFolder}`,
-      String(eightDaysAgo),
-    );
+    setRouterState(`compact_warning_seen:${heavyFolder}`, String(eightDaysAgo));
 
     const sendMessage = vi.fn(async () => {});
     await runSessionWarning({
@@ -402,5 +398,112 @@ describe('runSessionWarning', () => {
     });
 
     expect(sendMessage).not.toHaveBeenCalled();
+  });
+
+  it('uses live (post-compact) bytes for the threshold check', () => {
+    // Build a session jsonl that's huge on disk but mostly pre-compact.
+    const dir = path.join(
+      projectRoot,
+      'data',
+      'sessions',
+      heavyFolder,
+      '.claude',
+      'projects',
+      '-workspace-group',
+    );
+    fs.mkdirSync(dir, { recursive: true });
+    const file = path.join(dir, 'sess-heavy.jsonl');
+    const preCompact = 'x'.repeat(700_000) + '\n';
+    const boundary =
+      '{"type":"system","subtype":"compact_boundary","content":"Conversation compacted"}\n';
+    const summary = '{"type":"user","message":{"content":"summary"}}\n';
+    const postCompact = 'y'.repeat(5_000) + '\n';
+    fs.writeFileSync(file, preCompact + boundary + summary + postCompact);
+
+    setSession(heavyFolder, 'sess-heavy');
+
+    const totalBytes = fs.statSync(file).size;
+    expect(totalBytes).toBeGreaterThan(700_000);
+    expect(liveSessionBytes(file, totalBytes)).toBeLessThan(10_000);
+  });
+
+  it('does not warn when only pre-compact bulk pushes file over the threshold', async () => {
+    const dir = path.join(
+      projectRoot,
+      'data',
+      'sessions',
+      heavyFolder,
+      '.claude',
+      'projects',
+      '-workspace-group',
+    );
+    fs.mkdirSync(dir, { recursive: true });
+    const file = path.join(dir, 'sess-heavy.jsonl');
+    const preCompact = 'x'.repeat(700_000) + '\n';
+    const boundary =
+      '{"type":"system","subtype":"compact_boundary","content":"Conversation compacted"}\n';
+    const summary = '{"type":"user","message":{"content":"summary"}}\n';
+    fs.writeFileSync(file, preCompact + boundary + summary);
+    setSession(heavyFolder, 'sess-heavy');
+
+    const sendMessage = vi.fn(async () => {});
+    await runSessionWarning({
+      registeredGroups: () => ({
+        [mainJid]: {
+          name: 'Main',
+          folder: 'main',
+          trigger: '@Andy',
+          added_at: '2024-01-01T00:00:00.000Z',
+          isMain: true,
+        },
+      }),
+      sendMessage,
+      now: () => 1_700_000_000_000,
+    });
+
+    expect(sendMessage).not.toHaveBeenCalled();
+  });
+
+  it('still warns when post-compact live bytes are over the threshold', async () => {
+    process.env.AUTO_COMPACT_THRESHOLD_BYTES = '10000';
+    const dir = path.join(
+      projectRoot,
+      'data',
+      'sessions',
+      heavyFolder,
+      '.claude',
+      'projects',
+      '-workspace-group',
+    );
+    fs.mkdirSync(dir, { recursive: true });
+    const file = path.join(dir, 'sess-heavy.jsonl');
+    const preCompact = 'x'.repeat(50_000) + '\n';
+    const boundary =
+      '{"type":"system","subtype":"compact_boundary","content":"Conversation compacted"}\n';
+    const summary = '{"type":"user","message":{"content":"summary"}}\n';
+    const postCompact = 'y'.repeat(50_000) + '\n';
+    fs.writeFileSync(file, preCompact + boundary + summary + postCompact);
+    setSession(heavyFolder, 'sess-heavy');
+
+    const sendMessage = vi.fn(async () => {});
+    await runSessionWarning({
+      registeredGroups: () => ({
+        [mainJid]: {
+          name: 'Main',
+          folder: 'main',
+          trigger: '@Andy',
+          added_at: '2024-01-01T00:00:00.000Z',
+          isMain: true,
+        },
+      }),
+      sendMessage,
+      now: () => 1_700_000_000_000,
+    });
+
+    expect(sendMessage).toHaveBeenCalledTimes(1);
+    const call = sendMessage.mock.calls[0] as unknown as [string, string];
+    // The bundled warning shows live bytes and the on-disk total.
+    expect(call[1]).toContain('live');
+    expect(call[1]).toContain('on disk');
   });
 });
