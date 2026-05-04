@@ -1,5 +1,51 @@
+import * as path from 'node:path';
+
 import { Channel, NewMessage } from './types.js';
 import { formatLocalTime } from './timezone.js';
+
+const AGENT_GROUP_ROOT = '/workspace/group/';
+const ATTACH_MARKER_REGEX = /\[\[attach:([^\]\n]+)\]\]/g;
+
+/**
+ * Extract `[[attach:<agent-path>]]` markers from agent output.
+ *
+ * Markers reference the agent-side path (under `/workspace/group/`); we
+ * translate to the absolute host path under `groupsBaseDir/groupFolder/`
+ * and reject anything that escapes the group root via path traversal.
+ *
+ * The function is non-throwing: invalid markers are dropped from the text
+ * and recorded in `rejected` so the caller can log without losing the
+ * surrounding reply.
+ */
+export function parseAttachmentMarkers(
+  text: string,
+  groupFolder: string,
+  groupsBaseDir: string,
+): { text: string; attachments: string[]; rejected: string[] } {
+  const attachments: string[] = [];
+  const rejected: string[] = [];
+  const groupRoot = path.resolve(groupsBaseDir, groupFolder);
+
+  const cleaned = text.replace(ATTACH_MARKER_REGEX, (_, rawPath: string) => {
+    const trimmed = rawPath.trim();
+    if (!trimmed.startsWith(AGENT_GROUP_ROOT)) {
+      rejected.push(trimmed);
+      return '';
+    }
+    const rel = trimmed.slice(AGENT_GROUP_ROOT.length);
+    const hostPath = path.resolve(groupRoot, rel);
+    if (hostPath !== groupRoot && !hostPath.startsWith(groupRoot + path.sep)) {
+      rejected.push(trimmed);
+      return '';
+    }
+    attachments.push(hostPath);
+    return '';
+  });
+
+  // Tidy whitespace left behind by stripped markers.
+  const tidied = cleaned.replace(/[ \t]+\n/g, '\n').replace(/\n{3,}/g, '\n\n');
+  return { text: tidied.trim(), attachments, rejected };
+}
 
 export function escapeXml(s: string): string {
   if (!s) return '';

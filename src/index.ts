@@ -46,7 +46,12 @@ import {
 import { GroupQueue } from './group-queue.js';
 import { resolveGroupFolderPath } from './group-folder.js';
 import { startIpcWatcher } from './ipc.js';
-import { findChannel, formatMessages, formatOutbound } from './router.js';
+import {
+  findChannel,
+  formatMessages,
+  formatOutbound,
+  parseAttachmentMarkers,
+} from './router.js';
 import {
   restoreRemoteControl,
   startRemoteControl,
@@ -645,6 +650,25 @@ async function main(): Promise<void> {
     process.exit(1);
   }
 
+  // Helper: extract `[[attach:...]]` markers and translate to host paths.
+  // Called from outbound paths (scheduler, agent stream, IPC) so the agent
+  // can request file uploads from /workspace/group/outbox/.
+  function extractAttachments(
+    jid: string,
+    rawText: string,
+  ): { text: string; attachments: string[] } {
+    const group = registeredGroups[jid];
+    if (!group) return { text: rawText, attachments: [] };
+    const parsed = parseAttachmentMarkers(rawText, group.folder, GROUPS_DIR);
+    if (parsed.rejected.length > 0) {
+      logger.warn(
+        { jid, rejected: parsed.rejected },
+        'Attachment markers rejected',
+      );
+    }
+    return { text: parsed.text, attachments: parsed.attachments };
+  }
+
   // Start subsystems (independently of connection handler)
   startSchedulerLoop({
     registeredGroups: () => registeredGroups,
@@ -658,15 +682,31 @@ async function main(): Promise<void> {
         logger.warn({ jid }, 'No channel owns JID, cannot send message');
         return;
       }
-      const text = formatOutbound(rawText);
-      if (text) await channel.sendMessage(jid, text);
+      const cleaned = formatOutbound(rawText);
+      const { text, attachments } = extractAttachments(jid, cleaned);
+      if (!text && attachments.length === 0) return;
+      try {
+        await channel.sendMessage(
+          jid,
+          text,
+          attachments.length > 0 ? attachments : undefined,
+        );
+      } catch (err) {
+        logger.error({ jid, err }, 'Channel sendMessage failed');
+      }
     },
   });
   startIpcWatcher({
-    sendMessage: (jid, text) => {
+    sendMessage: async (jid, rawText) => {
       const channel = findChannel(channels, jid);
       if (!channel) throw new Error(`No channel for JID: ${jid}`);
-      return channel.sendMessage(jid, text);
+      const { text, attachments } = extractAttachments(jid, rawText);
+      if (!text && attachments.length === 0) return;
+      await channel.sendMessage(
+        jid,
+        text,
+        attachments.length > 0 ? attachments : undefined,
+      );
     },
     registeredGroups: () => registeredGroups,
     registerGroup,
