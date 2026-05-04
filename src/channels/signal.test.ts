@@ -1376,6 +1376,52 @@ describe('SignalChannel', () => {
       await channel.disconnect();
     });
 
+    it('does not double-append the extension when the cache id already has one', async () => {
+      // signal-cli sometimes stores attachments under "<id>.<ext>" and
+      // returns that as the id; the filename field is absent. We must not
+      // tack a second contentType-derived extension on top.
+      stashCacheFile('captured.png', 'png-bytes');
+      const opts = createTestOpts();
+      const channel = new SignalChannel(
+        'signal-cli',
+        '+15551234567',
+        '127.0.0.1',
+        7583,
+        opts,
+        false,
+      );
+      await channel.connect();
+
+      pushSseEvent({
+        sourceNumber: '+15555550123',
+        sourceName: 'Alice',
+        dataMessage: {
+          timestamp: 1700000006000,
+          message: 'shot',
+          groupInfo: { groupId: 'abc123', groupName: 'Test Group' },
+          attachments: [
+            { id: 'captured.png', contentType: 'image/png', size: 9 },
+          ],
+        },
+      });
+
+      await new Promise((r) => setTimeout(r, 50));
+
+      const [, msg] = lastOnMessageCall(opts);
+      expect(msg.attachments).toEqual([
+        expect.objectContaining({
+          path: '/workspace/group/inbox/1700000006000-attachment-captured.png',
+        }),
+      ]);
+      expect(
+        fs.existsSync(
+          path.join(inboxDir, '1700000006000-attachment-captured.png'),
+        ),
+      ).toBe(true);
+
+      await channel.disconnect();
+    });
+
     it('combines quote prefix with attachment markers', async () => {
       stashCacheFile('att-q', 'qbytes');
       const opts = createTestOpts();

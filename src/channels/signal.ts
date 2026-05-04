@@ -53,7 +53,12 @@ function sanitizeAttachmentName(
   const base = path.basename((filename ?? '').trim());
   const cleaned = base.replace(/[^A-Za-z0-9._-]/g, '_').replace(/_+/g, '_');
   if (!cleaned || /^[._]+$/.test(cleaned)) {
-    const ext = contentType ? (CONTENT_TYPE_EXT[contentType] ?? '') : '';
+    // signal-cli stores some attachments under an id that already includes
+    // the original extension (e.g. "wx58uQ1uPhnJnxVRpXGu.png"); only append
+    // a contentType-derived extension when the id has none.
+    const idHasExt = /\.[A-Za-z0-9]+$/.test(fallbackId);
+    const ext =
+      !idHasExt && contentType ? (CONTENT_TYPE_EXT[contentType] ?? '') : '';
     return `attachment-${fallbackId}${ext}`;
   }
   return cleaned;
