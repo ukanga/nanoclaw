@@ -79,7 +79,8 @@ function materializeAttachments(
   msgTimestamp: number,
 ): AttachmentMeta[] {
   const cacheDir = getSignalAttachmentsCacheDir();
-  const inboxDir = path.join(GROUPS_DIR, groupFolder, 'inbox');
+  const groupsBase = process.env.NANOCLAW_GROUPS_DIR ?? GROUPS_DIR;
+  const inboxDir = path.join(groupsBase, groupFolder, 'inbox');
   const result: AttachmentMeta[] = [];
 
   for (const att of attachments) {
@@ -831,6 +832,10 @@ export class SignalChannel implements Channel {
         content = `@${ASSISTANT_NAME} ${content}`;
       }
     }
+
+    // Drop messages that ended up entirely empty (e.g., oversize-only attachments
+    // that all got filtered out, leaving no text and nothing to attach).
+    if (!content && materializedAttachments.length === 0) return;
 
     this.opts.onMessage(chatJid, {
       id: String(dataMessage.timestamp ?? Date.now()),

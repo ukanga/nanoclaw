@@ -1,3 +1,6 @@
+import * as fs from 'node:fs';
+import * as os from 'node:os';
+import * as path from 'node:path';
 import { describe, it, expect, beforeEach, vi, afterEach } from 'vitest';
 
 // --- Mocks ---
@@ -1078,6 +1081,342 @@ describe('SignalChannel', () => {
           }
           return new Response('Not Found', { status: 404 });
         },
+      );
+
+      await channel.disconnect();
+    });
+  });
+
+  // --- Inbound attachments ---
+
+  describe('inbound attachments', () => {
+    let testRoot: string;
+    let cacheDir: string;
+    let groupsDir: string;
+    let inboxDir: string;
+    const groupJid = 'signal:group:abc123';
+    const groupFolder = 'test-group';
+
+    function stashCacheFile(
+      id: string,
+      contents: string | Buffer = 'fake bytes',
+      ext = '',
+    ): void {
+      fs.writeFileSync(path.join(cacheDir, `${id}${ext}`), contents);
+    }
+
+    function lastOnMessageCall(opts: SignalChannelOpts) {
+      const calls = (opts.onMessage as ReturnType<typeof vi.fn>).mock.calls;
+      return calls[calls.length - 1] as [string, Record<string, unknown>];
+    }
+
+    beforeEach(() => {
+      testRoot = fs.mkdtempSync(
+        path.join(os.tmpdir(), 'signal-attachments-test-'),
+      );
+      cacheDir = path.join(testRoot, 'cache');
+      groupsDir = path.join(testRoot, 'groups');
+      inboxDir = path.join(groupsDir, groupFolder, 'inbox');
+      fs.mkdirSync(cacheDir, { recursive: true });
+      fs.mkdirSync(groupsDir, { recursive: true });
+      process.env.SIGNAL_ATTACHMENTS_DIR = cacheDir;
+      process.env.NANOCLAW_GROUPS_DIR = groupsDir;
+    });
+
+    afterEach(() => {
+      delete process.env.SIGNAL_ATTACHMENTS_DIR;
+      delete process.env.NANOCLAW_GROUPS_DIR;
+      fs.rmSync(testRoot, { recursive: true, force: true });
+    });
+
+    it('materializes a single image attachment with caption', async () => {
+      stashCacheFile('att1', 'png-bytes');
+      const opts = createTestOpts();
+      const channel = new SignalChannel(
+        'signal-cli',
+        '+15551234567',
+        '127.0.0.1',
+        7583,
+        opts,
+        false,
+      );
+      await channel.connect();
+
+      pushSseEvent({
+        sourceNumber: '+15555550123',
+        sourceName: 'Alice',
+        dataMessage: {
+          timestamp: 1700000000000,
+          message: 'Look at this',
+          groupInfo: { groupId: 'abc123', groupName: 'Test Group' },
+          attachments: [
+            {
+              id: 'att1',
+              contentType: 'image/png',
+              filename: 'budget.png',
+              size: 9,
+            },
+          ],
+        },
+      });
+
+      await new Promise((r) => setTimeout(r, 50));
+
+      const [jid, msg] = lastOnMessageCall(opts);
+      expect(jid).toBe(groupJid);
+      expect(msg.content).toContain('Look at this');
+      expect(msg.content).toContain(
+        '[Attachment: /workspace/group/inbox/1700000000000-budget.png, image/png, 9 B]',
+      );
+      expect(msg.attachments).toEqual([
+        {
+          path: '/workspace/group/inbox/1700000000000-budget.png',
+          contentType: 'image/png',
+          filename: 'budget.png',
+          size: 9,
+        },
+      ]);
+      expect(
+        fs.existsSync(path.join(inboxDir, '1700000000000-budget.png')),
+      ).toBe(true);
+
+      await channel.disconnect();
+    });
+
+    it('handles multi-file attachment message with no caption', async () => {
+      stashCacheFile('att-a', 'A'.repeat(2048));
+      stashCacheFile('att-b', 'B'.repeat(500));
+      const opts = createTestOpts();
+      const channel = new SignalChannel(
+        'signal-cli',
+        '+15551234567',
+        '127.0.0.1',
+        7583,
+        opts,
+        false,
+      );
+      await channel.connect();
+
+      pushSseEvent({
+        sourceNumber: '+15555550123',
+        sourceName: 'Alice',
+        dataMessage: {
+          timestamp: 1700000001000,
+          message: '',
+          groupInfo: { groupId: 'abc123', groupName: 'Test Group' },
+          attachments: [
+            {
+              id: 'att-a',
+              contentType: 'application/pdf',
+              filename: 'report.pdf',
+              size: 2048,
+            },
+            {
+              id: 'att-b',
+              contentType: 'image/jpeg',
+              filename: 'chart.jpg',
+              size: 500,
+            },
+          ],
+        },
+      });
+
+      await new Promise((r) => setTimeout(r, 50));
+
+      const [, msg] = lastOnMessageCall(opts);
+      expect(msg.content).toBe(
+        [
+          '[Attachment: /workspace/group/inbox/1700000001000-report.pdf, application/pdf, 2 KB]',
+          '[Attachment: /workspace/group/inbox/1700000001000-chart.jpg, image/jpeg, 500 B]',
+        ].join('\n'),
+      );
+      expect((msg.attachments as unknown[]).length).toBe(2);
+      expect(
+        fs.existsSync(path.join(inboxDir, '1700000001000-report.pdf')),
+      ).toBe(true);
+      expect(
+        fs.existsSync(path.join(inboxDir, '1700000001000-chart.jpg')),
+      ).toBe(true);
+
+      await channel.disconnect();
+    });
+
+    it('skips oversize attachments and drops the message when nothing remains', async () => {
+      stashCacheFile('big', 'x'.repeat(10));
+      const opts = createTestOpts();
+      const channel = new SignalChannel(
+        'signal-cli',
+        '+15551234567',
+        '127.0.0.1',
+        7583,
+        opts,
+        false,
+      );
+      await channel.connect();
+
+      pushSseEvent({
+        sourceNumber: '+15555550123',
+        sourceName: 'Alice',
+        dataMessage: {
+          timestamp: 1700000002000,
+          message: '',
+          groupInfo: { groupId: 'abc123', groupName: 'Test Group' },
+          attachments: [
+            {
+              id: 'big',
+              contentType: 'video/mp4',
+              filename: 'huge.mp4',
+              size: 30 * 1024 * 1024,
+            },
+          ],
+        },
+      });
+
+      await new Promise((r) => setTimeout(r, 50));
+
+      expect(opts.onMessage).not.toHaveBeenCalled();
+      expect(
+        fs.existsSync(path.join(inboxDir, '1700000002000-huge.mp4')),
+      ).toBe(false);
+
+      await channel.disconnect();
+    });
+
+    it('sanitizes malicious filenames', async () => {
+      stashCacheFile('att-evil', 'data');
+      const opts = createTestOpts();
+      const channel = new SignalChannel(
+        'signal-cli',
+        '+15551234567',
+        '127.0.0.1',
+        7583,
+        opts,
+        false,
+      );
+      await channel.connect();
+
+      pushSseEvent({
+        sourceNumber: '+15555550123',
+        sourceName: 'Alice',
+        dataMessage: {
+          timestamp: 1700000003000,
+          message: 'evil',
+          groupInfo: { groupId: 'abc123', groupName: 'Test Group' },
+          attachments: [
+            {
+              id: 'att-evil',
+              contentType: 'application/pdf',
+              filename: '../../../etc/passwd',
+              size: 4,
+            },
+          ],
+        },
+      });
+
+      await new Promise((r) => setTimeout(r, 50));
+
+      const [, msg] = lastOnMessageCall(opts);
+      // basename + sanitization: "../../../etc/passwd" → basename "passwd" → "passwd"
+      expect(msg.attachments).toEqual([
+        expect.objectContaining({
+          path: '/workspace/group/inbox/1700000003000-passwd',
+        }),
+      ]);
+      expect(fs.existsSync(path.join(inboxDir, '1700000003000-passwd'))).toBe(
+        true,
+      );
+      // No file written outside the expected inbox directory
+      const inboxEntries = fs.readdirSync(inboxDir);
+      expect(inboxEntries).toEqual(['1700000003000-passwd']);
+
+      await channel.disconnect();
+    });
+
+    it('warns and skips when source file is missing from cache', async () => {
+      // Note: no stashCacheFile call — the source is missing.
+      const opts = createTestOpts();
+      const channel = new SignalChannel(
+        'signal-cli',
+        '+15551234567',
+        '127.0.0.1',
+        7583,
+        opts,
+        false,
+      );
+      await channel.connect();
+
+      pushSseEvent({
+        sourceNumber: '+15555550123',
+        sourceName: 'Alice',
+        dataMessage: {
+          timestamp: 1700000004000,
+          message: 'where is it',
+          groupInfo: { groupId: 'abc123', groupName: 'Test Group' },
+          attachments: [
+            {
+              id: 'ghost',
+              contentType: 'image/png',
+              filename: 'ghost.png',
+              size: 100,
+            },
+          ],
+        },
+      });
+
+      await new Promise((r) => setTimeout(r, 50));
+
+      // Message still delivered (it has caption text), but with no attachment
+      const [, msg] = lastOnMessageCall(opts);
+      expect(msg.content).toBe('where is it');
+      expect(msg.attachments).toBeUndefined();
+      expect(fs.existsSync(path.join(inboxDir, '1700000004000-ghost.png'))).toBe(
+        false,
+      );
+
+      await channel.disconnect();
+    });
+
+    it('combines quote prefix with attachment markers', async () => {
+      stashCacheFile('att-q', 'qbytes');
+      const opts = createTestOpts();
+      const channel = new SignalChannel(
+        'signal-cli',
+        '+15551234567',
+        '127.0.0.1',
+        7583,
+        opts,
+        false,
+      );
+      await channel.connect();
+
+      pushSseEvent({
+        sourceNumber: '+15555550123',
+        sourceName: 'Alice',
+        dataMessage: {
+          timestamp: 1700000005000,
+          message: 'See attached',
+          groupInfo: { groupId: 'abc123', groupName: 'Test Group' },
+          quote: {
+            id: 1699999999000,
+            authorNumber: '+15555550888',
+            text: 'Can you send the file?',
+          },
+          attachments: [
+            {
+              id: 'att-q',
+              contentType: 'application/pdf',
+              filename: 'doc.pdf',
+              size: 6,
+            },
+          ],
+        },
+      });
+
+      await new Promise((r) => setTimeout(r, 50));
+
+      const [, msg] = lastOnMessageCall(opts);
+      expect(msg.content).toBe(
+        '> +15555550888: Can you send the file?\n\nSee attached\n[Attachment: /workspace/group/inbox/1700000005000-doc.pdf, application/pdf, 6 B]',
       );
 
       await channel.disconnect();
