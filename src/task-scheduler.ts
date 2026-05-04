@@ -380,10 +380,7 @@ export async function runAttachmentCleanup(): Promise<void> {
   }
 
   if (totalDeleted > 0) {
-    logger.info(
-      { totalDeleted, totalBytes },
-      'Attachment cleanup: completed',
-    );
+    logger.info({ totalDeleted, totalBytes }, 'Attachment cleanup: completed');
   }
 }
 

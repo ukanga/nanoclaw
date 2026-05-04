@@ -64,9 +64,7 @@ describe('parseAttachmentMarkers', () => {
       groupsBaseDir,
     );
     expect(result.attachments).toEqual([]);
-    expect(result.rejected).toEqual([
-      '/workspace/group/../../etc/passwd',
-    ]);
+    expect(result.rejected).toEqual(['/workspace/group/../../etc/passwd']);
     expect(result.text).toBe('');
   });
 

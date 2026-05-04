@@ -145,9 +145,7 @@ describe('runAttachmentCleanup', () => {
   }
 
   beforeEach(() => {
-    groupsDir = fs.mkdtempSync(
-      path.join(os.tmpdir(), 'attach-cleanup-test-'),
-    );
+    groupsDir = fs.mkdtempSync(path.join(os.tmpdir(), 'attach-cleanup-test-'));
     process.env.NANOCLAW_GROUPS_DIR = groupsDir;
     delete process.env.ATTACHMENT_RETENTION_DAYS;
   });

@@ -1468,7 +1468,9 @@ describe('SignalChannel', () => {
       const channel = createChannel();
       await channel.connect();
 
-      await channel.sendMessage('signal:+15555550123', 'Here it is', [filePath]);
+      await channel.sendMessage('signal:+15555550123', 'Here it is', [
+        filePath,
+      ]);
 
       const params = lastSendPayload();
       expect(params.message).toBe('Here it is');

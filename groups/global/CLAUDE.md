@@ -38,6 +38,27 @@ When working as a sub-agent or teammate, only use `send_message` if instructed t
 
 Files you create are saved in `/workspace/group/`. Use this for notes, research, or anything that should persist.
 
+## Attachments (Signal)
+
+When the user sends a file via Signal, the channel materializes it into `/workspace/group/inbox/` and appends a marker line to the message text:
+
+```
+Look at this
+[Attachment: /workspace/group/inbox/1700000000000-budget.pdf, application/pdf, 412 KB]
+```
+
+Open the file with the standard `Read` tool — the path in the marker is what to read.
+
+To send a file back, write it under `/workspace/group/outbox/` and reference it in your reply with a `[[attach:...]]` token. Tokens are stripped from the visible text and the file is sent as a Signal attachment:
+
+```
+Here's the revised budget.
+
+[[attach:/workspace/group/outbox/budget-2026-revised.xlsx]]
+```
+
+Multiple `[[attach:...]]` tokens in one reply are allowed; each becomes its own attachment. A reply may be attachment-only (no text). Paths must start with `/workspace/group/` — anything outside the group is rejected. Files under `inbox/` and `outbox/` are auto-deleted after 30 days (configurable via `ATTACHMENT_RETENTION_DAYS`).
+
 ## Memory
 
 The `conversations/` folder contains searchable history of past conversations. Use this to recall context from previous sessions.

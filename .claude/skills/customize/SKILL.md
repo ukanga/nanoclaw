@@ -86,6 +86,16 @@ Implementation:
 2. Update paths in config
 3. Provide setup instructions
 
+### Attachment Retention
+
+Inbound and outbound Signal attachments live under `groups/<folder>/inbox/` and `groups/<folder>/outbox/`. A daily housekeeping loop deletes files older than 30 days. Override via `.env`:
+
+```
+ATTACHMENT_RETENTION_DAYS=90
+```
+
+Indefinite retention isn't supported — set a high value if you need long-term storage and back the directories up separately.
+
 ## After Changes
 
 Always tell the user:
