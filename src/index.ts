@@ -228,6 +228,28 @@ export function _setRegisteredGroups(
 }
 
 /**
+ * Extract `[[attach:<agent-path>]]` markers from agent output and translate
+ * them to absolute host paths under groups/<folder>/. Called from every
+ * outbound path (streaming agent output, scheduler-agent, IPC) so the agent
+ * can request Signal attachments from /workspace/group/outbox/.
+ */
+function extractAttachments(
+  jid: string,
+  rawText: string,
+): { text: string; attachments: string[] } {
+  const group = registeredGroups[jid];
+  if (!group) return { text: rawText, attachments: [] };
+  const parsed = parseAttachmentMarkers(rawText, group.folder, GROUPS_DIR);
+  if (parsed.rejected.length > 0) {
+    logger.warn(
+      { jid, rejected: parsed.rejected },
+      'Attachment markers rejected',
+    );
+  }
+  return { text: parsed.text, attachments: parsed.attachments };
+}
+
+/**
  * Process all pending messages for a group.
  * Called by the GroupQueue when it's this group's turn.
  */
@@ -344,11 +366,27 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
           ? result.result
           : JSON.stringify(result.result);
       // Strip <internal>...</internal> blocks — agent uses these for internal reasoning
-      const text = raw.replace(/<internal>[\s\S]*?<\/internal>/g, '').trim();
+      const cleaned = raw
+        .replace(/<internal>[\s\S]*?<\/internal>/g, '')
+        .trim();
       logger.info({ group: group.name }, `Agent output: ${raw.length} chars`);
-      if (text) {
-        await channel.sendMessage(chatJid, text);
-        outputSentToUser = true;
+      // Translate any [[attach:/workspace/group/...]] markers into Signal
+      // attachments before sending so the agent can ship files alongside text.
+      const { text, attachments } = extractAttachments(chatJid, cleaned);
+      if (text || attachments.length > 0) {
+        try {
+          await channel.sendMessage(
+            chatJid,
+            text,
+            attachments.length > 0 ? attachments : undefined,
+          );
+          outputSentToUser = true;
+        } catch (err) {
+          logger.error(
+            { chatJid, err },
+            'Channel sendMessage failed in streaming output',
+          );
+        }
       }
       // Only reset idle timer on actual results, not session-update markers (result: null)
       resetIdleTimer();
@@ -537,7 +575,9 @@ async function startMessageLoop(): Promise<void> {
               isSessionCommandAllowed(
                 isMainGroup,
                 loopCmdMsg.is_from_me === true,
-                Boolean(loopCmdMsg.sender && ADMIN_SENDERS.has(loopCmdMsg.sender)),
+                Boolean(
+                  loopCmdMsg.sender && ADMIN_SENDERS.has(loopCmdMsg.sender),
+                ),
               )
             ) {
               queue.closeStdin(chatJid);
@@ -760,24 +800,6 @@ async function main(): Promise<void> {
     process.exit(1);
   }
 
-  // Helper: extract `[[attach:...]]` markers and translate to host paths.
-  // Called from outbound paths (scheduler, agent stream, IPC) so the agent
-  // can request file uploads from /workspace/group/outbox/.
-  function extractAttachments(
-    jid: string,
-    rawText: string,
-  ): { text: string; attachments: string[] } {
-    const group = registeredGroups[jid];
-    if (!group) return { text: rawText, attachments: [] };
-    const parsed = parseAttachmentMarkers(rawText, group.folder, GROUPS_DIR);
-    if (parsed.rejected.length > 0) {
-      logger.warn(
-        { jid, rejected: parsed.rejected },
-        'Attachment markers rejected',
-      );
-    }
-    return { text: parsed.text, attachments: parsed.attachments };
-  }
 
   // Start subsystems (independently of connection handler)
   startSchedulerLoop({
