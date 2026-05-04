@@ -130,6 +130,16 @@ function materializeAttachments(
   return result;
 }
 
+function humanFileSize(bytes: number): string {
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${Math.round(bytes / 1024)} KB`;
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+function formatAttachmentMarker(att: AttachmentMeta): string {
+  return `[Attachment: ${att.path}, ${att.contentType}, ${humanFileSize(att.size)}]`;
+}
+
 // ---------------------------------------------------------------------------
 // Signal CLI daemon management
 // ---------------------------------------------------------------------------
@@ -806,6 +816,14 @@ export class SignalChannel implements Channel {
       }
     }
 
+    // Append per-attachment markers so the agent sees the file paths
+    if (materializedAttachments.length > 0) {
+      const markers = materializedAttachments
+        .map(formatAttachmentMarker)
+        .join('\n');
+      content = content ? `${content}\n${markers}` : markers;
+    }
+
     // Trigger detection for groups
     if (isGroup && !TRIGGER_PATTERN.test(content)) {
       const nameRegex = new RegExp(`\\b${escapeRegex(ASSISTANT_NAME)}\\b`, 'i');
@@ -823,7 +841,9 @@ export class SignalChannel implements Channel {
       timestamp,
       is_from_me: false,
       attachments:
-        materializedAttachments.length > 0 ? materializedAttachments : undefined,
+        materializedAttachments.length > 0
+          ? materializedAttachments
+          : undefined,
     });
 
     logger.info(
