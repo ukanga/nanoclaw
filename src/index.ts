@@ -63,7 +63,10 @@ import {
   loadSenderAllowlist,
   shouldDropMessage,
 } from './sender-allowlist.js';
-import { startSchedulerLoop } from './task-scheduler.js';
+import {
+  startAttachmentCleanupLoop,
+  startSchedulerLoop,
+} from './task-scheduler.js';
 import { Channel, NewMessage, RegisteredGroup } from './types.js';
 import { logger } from './logger.js';
 
@@ -696,6 +699,7 @@ async function main(): Promise<void> {
       }
     },
   });
+  startAttachmentCleanupLoop();
   startIpcWatcher({
     sendMessage: async (jid, rawText) => {
       const channel = findChannel(channels, jid);

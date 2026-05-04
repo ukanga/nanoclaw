@@ -1,8 +1,14 @@
 import { ChildProcess } from 'child_process';
 import { CronExpressionParser } from 'cron-parser';
 import fs from 'fs';
+import path from 'path';
 
-import { ASSISTANT_NAME, SCHEDULER_POLL_INTERVAL, TIMEZONE } from './config.js';
+import {
+  ASSISTANT_NAME,
+  GROUPS_DIR,
+  SCHEDULER_POLL_INTERVAL,
+  TIMEZONE,
+} from './config.js';
 import {
   ContainerOutput,
   runContainerAgent,
@@ -281,4 +287,129 @@ export function startSchedulerLoop(deps: SchedulerDependencies): void {
 /** @internal - for tests only. */
 export function _resetSchedulerLoopForTests(): void {
   schedulerRunning = false;
+}
+
+// ---------------------------------------------------------------------------
+// Attachment cleanup
+// ---------------------------------------------------------------------------
+
+const ATTACHMENT_SUBDIRS = ['inbox', 'outbox'];
+const ATTACHMENT_CLEANUP_INTERVAL_MS = 24 * 60 * 60 * 1000;
+const ATTACHMENT_CLEANUP_INITIAL_DELAY_MS = 60_000;
+
+function getAttachmentRetentionMs(): number {
+  const raw = process.env.ATTACHMENT_RETENTION_DAYS;
+  const days = raw ? parseInt(raw, 10) : 30;
+  const safe = Number.isFinite(days) && days > 0 ? days : 30;
+  return safe * 24 * 60 * 60 * 1000;
+}
+
+function getAttachmentBaseDir(): string {
+  return process.env.NANOCLAW_GROUPS_DIR ?? GROUPS_DIR;
+}
+
+/**
+ * Delete files in every `groups/*\/inbox/` and `groups/*\/outbox/`
+ * older than ATTACHMENT_RETENTION_DAYS (default 30). Logs per-group
+ * counts when something gets pruned. Safe to run on a missing tree.
+ */
+export async function runAttachmentCleanup(): Promise<void> {
+  const baseDir = getAttachmentBaseDir();
+  if (!fs.existsSync(baseDir)) return;
+
+  const cutoff = Date.now() - getAttachmentRetentionMs();
+  let totalDeleted = 0;
+  let totalBytes = 0;
+
+  let groupNames: string[];
+  try {
+    groupNames = fs.readdirSync(baseDir);
+  } catch (err) {
+    logger.warn({ err, baseDir }, 'Attachment cleanup: cannot read groups dir');
+    return;
+  }
+
+  for (const groupName of groupNames) {
+    const groupDir = path.join(baseDir, groupName);
+    try {
+      if (!fs.statSync(groupDir).isDirectory()) continue;
+    } catch {
+      continue;
+    }
+
+    let groupDeleted = 0;
+    let groupBytes = 0;
+
+    for (const sub of ATTACHMENT_SUBDIRS) {
+      const dir = path.join(groupDir, sub);
+      if (!fs.existsSync(dir)) continue;
+
+      let files: string[];
+      try {
+        files = fs.readdirSync(dir);
+      } catch {
+        continue;
+      }
+
+      for (const file of files) {
+        const filePath = path.join(dir, file);
+        try {
+          const stat = fs.statSync(filePath);
+          if (!stat.isFile()) continue;
+          if (stat.mtimeMs >= cutoff) continue;
+          fs.rmSync(filePath, { force: true });
+          groupDeleted++;
+          groupBytes += stat.size;
+        } catch (err) {
+          logger.warn(
+            { err, filePath },
+            'Attachment cleanup: failed to delete file',
+          );
+        }
+      }
+    }
+
+    if (groupDeleted > 0) {
+      logger.info(
+        { group: groupName, deleted: groupDeleted, bytes: groupBytes },
+        'Attachment cleanup: pruned old files',
+      );
+      totalDeleted += groupDeleted;
+      totalBytes += groupBytes;
+    }
+  }
+
+  if (totalDeleted > 0) {
+    logger.info(
+      { totalDeleted, totalBytes },
+      'Attachment cleanup: completed',
+    );
+  }
+}
+
+let attachmentCleanupRunning = false;
+
+export function startAttachmentCleanupLoop(): void {
+  if (attachmentCleanupRunning) {
+    logger.debug('Attachment cleanup loop already running');
+    return;
+  }
+  attachmentCleanupRunning = true;
+  logger.info('Attachment cleanup loop started');
+
+  const tick = async () => {
+    try {
+      await runAttachmentCleanup();
+    } catch (err) {
+      logger.error({ err }, 'Attachment cleanup loop error');
+    }
+    setTimeout(tick, ATTACHMENT_CLEANUP_INTERVAL_MS);
+  };
+
+  setTimeout(tick, ATTACHMENT_CLEANUP_INITIAL_DELAY_MS);
+}
+
+/** @internal - for tests only. */
+export function _resetAttachmentCleanupForTests(): void {
+  attachmentCleanupRunning = false;
 }

@@ -1,9 +1,13 @@
+import * as fs from 'node:fs';
+import * as os from 'node:os';
+import * as path from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { _initTestDatabase, createTask, getTaskById } from './db.js';
 import {
   _resetSchedulerLoopForTests,
   computeNextRun,
+  runAttachmentCleanup,
   startSchedulerLoop,
 } from './task-scheduler.js';
 
@@ -125,5 +129,78 @@ describe('task scheduler', () => {
     const offset =
       (new Date(nextRun!).getTime() - new Date(scheduledTime).getTime()) % ms;
     expect(offset).toBe(0);
+  });
+});
+
+describe('runAttachmentCleanup', () => {
+  let groupsDir: string;
+  const ageDay = 24 * 60 * 60 * 1000;
+
+  function makeFile(rel: string, mtimeMs: number): string {
+    const full = path.join(groupsDir, rel);
+    fs.mkdirSync(path.dirname(full), { recursive: true });
+    fs.writeFileSync(full, 'x');
+    fs.utimesSync(full, mtimeMs / 1000, mtimeMs / 1000);
+    return full;
+  }
+
+  beforeEach(() => {
+    groupsDir = fs.mkdtempSync(
+      path.join(os.tmpdir(), 'attach-cleanup-test-'),
+    );
+    process.env.NANOCLAW_GROUPS_DIR = groupsDir;
+    delete process.env.ATTACHMENT_RETENTION_DAYS;
+  });
+
+  afterEach(() => {
+    delete process.env.NANOCLAW_GROUPS_DIR;
+    delete process.env.ATTACHMENT_RETENTION_DAYS;
+    fs.rmSync(groupsDir, { recursive: true, force: true });
+  });
+
+  it('deletes inbox/outbox files older than the retention window', async () => {
+    const now = Date.now();
+    const old = makeFile('team-a/inbox/old.pdf', now - 40 * ageDay);
+    const fresh = makeFile('team-a/inbox/fresh.pdf', now - 5 * ageDay);
+    const oldOut = makeFile('team-a/outbox/old.xlsx', now - 35 * ageDay);
+
+    await runAttachmentCleanup();
+
+    expect(fs.existsSync(old)).toBe(false);
+    expect(fs.existsSync(oldOut)).toBe(false);
+    expect(fs.existsSync(fresh)).toBe(true);
+  });
+
+  it('respects ATTACHMENT_RETENTION_DAYS override', async () => {
+    process.env.ATTACHMENT_RETENTION_DAYS = '3';
+    const now = Date.now();
+    const file = makeFile('team-a/inbox/short-lived.pdf', now - 5 * ageDay);
+
+    await runAttachmentCleanup();
+
+    expect(fs.existsSync(file)).toBe(false);
+  });
+
+  it('skips groups that have no inbox/outbox', async () => {
+    fs.mkdirSync(path.join(groupsDir, 'no-attachments'), { recursive: true });
+    await expect(runAttachmentCleanup()).resolves.toBeUndefined();
+  });
+
+  it('does not touch subdirectories or non-files', async () => {
+    fs.mkdirSync(path.join(groupsDir, 'team-a/inbox/nested'), {
+      recursive: true,
+    });
+    const old = makeFile(
+      'team-a/inbox/nested/should-stay.pdf',
+      Date.now() - 60 * ageDay,
+    );
+    await runAttachmentCleanup();
+    expect(fs.existsSync(old)).toBe(true);
+  });
+
+  it('is a no-op when the groups dir is missing', async () => {
+    delete process.env.NANOCLAW_GROUPS_DIR;
+    process.env.NANOCLAW_GROUPS_DIR = path.join(groupsDir, 'does-not-exist');
+    await expect(runAttachmentCleanup()).resolves.toBeUndefined();
   });
 });
