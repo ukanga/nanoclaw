@@ -352,6 +352,10 @@ async function runQuery(
       closedDuringQuery = true;
       stream.end();
       ipcPolling = false;
+      // Hard deadline: if runQuery doesn't return within 10s of close
+      // (e.g. SDK iterator wedges on a dangling claude/MCP subprocess),
+      // force-exit. Functionally identical to SIGKILL for the orchestrator.
+      setTimeout(() => process.exit(0), 10_000).unref();
       return;
     }
     const messages = drainIpcInput();
@@ -724,6 +728,13 @@ async function main(): Promise<void> {
     });
     process.exit(1);
   }
+
+  // Streaming mode is over (_close received). The SDK may have left
+  // claude/MCP subprocesses with open stdio pipes that keep the event
+  // loop alive; force-exit so the container terminates promptly and the
+  // orchestrator's runForGroup finally block can drain any session
+  // command queued while we were still streaming.
+  process.exit(0);
 }
 
 main();
