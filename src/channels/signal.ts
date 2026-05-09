@@ -64,14 +64,30 @@ function sanitizeAttachmentName(
   return cleaned;
 }
 
-function findCachedAttachment(cacheDir: string, id: string): string | null {
+function signalCachePlaceholderExists(cacheDir: string, id: string): boolean {
   const direct = path.join(cacheDir, id);
-  if (fs.existsSync(direct)) return direct;
+  if (fs.existsSync(direct)) return true;
   try {
-    const match = fs
+    return fs
       .readdirSync(cacheDir)
-      .find((f) => f === id || f.startsWith(`${id}.`));
-    if (match) return path.join(cacheDir, match);
+      .some((f) => f === id || f.startsWith(`${id}.`));
+  } catch {
+    return false;
+  }
+}
+
+function findCachedAttachment(cacheDir: string, id: string): string | null {
+  // Reject 0-byte hits: signal-cli leaves empty placeholders when its blob download from cdnX.signal.org fails.
+  const direct = path.join(cacheDir, id);
+  if (fs.existsSync(direct) && fs.statSync(direct).size > 0) return direct;
+  try {
+    const matches = fs
+      .readdirSync(cacheDir)
+      .filter((f) => f === id || f.startsWith(`${id}.`));
+    for (const match of matches) {
+      const p = path.join(cacheDir, match);
+      if (fs.statSync(p).size > 0) return p;
+    }
   } catch {
     /* unreadable cache dir */
   }
@@ -102,9 +118,12 @@ function materializeAttachments(
 
     const src = findCachedAttachment(cacheDir, att.id);
     if (!src) {
+      const placeholder = signalCachePlaceholderExists(cacheDir, att.id);
       logger.warn(
-        { id: att.id, cacheDir },
-        'Signal: attachment cache file missing, skipping',
+        { id: att.id, cacheDir, placeholder },
+        placeholder
+          ? 'Signal: attachment cache file is empty (signal-cli download failed), skipping'
+          : 'Signal: attachment cache file missing, skipping',
       );
       continue;
     }
@@ -120,6 +139,19 @@ function materializeAttachments(
     try {
       fs.mkdirSync(inboxDir, { recursive: true });
       fs.copyFileSync(src, destPath);
+      if (fs.statSync(destPath).size === 0) {
+        // Race: source had bytes during findCachedAttachment but was truncated/rotated before the copy.
+        try {
+          fs.unlinkSync(destPath);
+        } catch {
+          /* best-effort */
+        }
+        logger.warn(
+          { id: att.id, src, destPath },
+          'Signal: copied attachment was 0 bytes, dropping',
+        );
+        continue;
+      }
     } catch (err) {
       logger.warn({ err, src, destPath }, 'Signal: failed to copy attachment');
       continue;
