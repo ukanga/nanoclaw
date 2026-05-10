@@ -203,6 +203,20 @@ function buildVolumeMounts(
     if (needsCopy) {
       fs.cpSync(agentRunnerSrc, groupAgentRunnerDir, { recursive: true });
     }
+    // Prune top-level entries not in canonical source. cpSync overwrites
+    // but never removes; stale files (e.g. from a prior runner architecture)
+    // get type-checked by entrypoint tsc and break the container build.
+    if (fs.existsSync(groupAgentRunnerDir)) {
+      const canonical = new Set(fs.readdirSync(agentRunnerSrc));
+      for (const entry of fs.readdirSync(groupAgentRunnerDir)) {
+        if (!canonical.has(entry)) {
+          fs.rmSync(path.join(groupAgentRunnerDir, entry), {
+            recursive: true,
+            force: true,
+          });
+        }
+      }
+    }
   }
   mounts.push({
     hostPath: groupAgentRunnerDir,
