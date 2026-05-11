@@ -645,7 +645,10 @@ export class SignalChannel implements Channel {
       }
     }
 
-    logger.info({ jid, length: text.length }, 'Signal message sent');
+    logger.info(
+      { jid, length: text.length, attachmentCount: attachmentPaths.length },
+      'Signal message sent',
+    );
   }
 
   isConnected(): boolean {
