@@ -465,8 +465,7 @@ async function runAgent(
   // (or ECONNRESET, ETIMEDOUT, etc). Intercept that pattern, swallow it, and
   // retry the container with the same session — only forward it to the user
   // if every retry also fails.
-  const API_ERROR_RE =
-    /^API Error: Unable to connect to API \(([A-Z_]+)\)\s*$/;
+  const API_ERROR_RE = /^API Error: Unable to connect to API \(([A-Z_]+)\)\s*$/;
   const MAX_API_RETRIES = 2;
   const RETRY_BACKOFF_MS = [2_000, 5_000];
 
