@@ -432,7 +432,6 @@ async function runAgent(
   onOutput?: (output: ContainerOutput) => Promise<void>,
 ): Promise<'success' | 'error'> {
   const isMain = group.isMain === true;
-  const sessionId = sessions[group.folder];
 
   // Update tasks snapshot for container to read (filtered by group)
   const tasks = getAllTasks();
@@ -460,51 +459,104 @@ async function runAgent(
     new Set(Object.keys(registeredGroups)),
   );
 
-  // Wrap onOutput to track session ID from streamed results
-  const wrappedOnOutput = onOutput
-    ? async (output: ContainerOutput) => {
-        if (output.newSessionId) {
-          sessions[group.folder] = output.newSessionId;
-          setSession(group.folder, output.newSessionId);
-        }
-        await onOutput(output);
-      }
-    : undefined;
+  // The Claude Code SDK packages transient network failures to the Anthropic
+  // API as a "successful" result whose text is literally
+  //   "API Error: Unable to connect to API (UND_ERR_SOCKET)"
+  // (or ECONNRESET, ETIMEDOUT, etc). Intercept that pattern, swallow it, and
+  // retry the container with the same session — only forward it to the user
+  // if every retry also fails.
+  const API_ERROR_RE =
+    /^API Error: Unable to connect to API \(([A-Z_]+)\)\s*$/;
+  const MAX_API_RETRIES = 2;
+  const RETRY_BACKOFF_MS = [2_000, 5_000];
 
-  try {
-    const output = await runContainerAgent(
-      group,
-      {
-        prompt,
-        sessionId,
-        groupFolder: group.folder,
-        chatJid,
-        isMain,
-        assistantName: ASSISTANT_NAME,
-      },
-      (proc, containerName) =>
-        queue.registerProcess(chatJid, proc, containerName, group.folder),
-      wrappedOnOutput,
-    );
+  let cachedApiError: ContainerOutput | null = null;
+  let sawApiError = false;
 
+  const wrappedOnOutput = async (output: ContainerOutput) => {
     if (output.newSessionId) {
       sessions[group.folder] = output.newSessionId;
       setSession(group.folder, output.newSessionId);
     }
 
-    if (output.status === 'error') {
-      logger.error(
-        { group: group.name, error: output.error },
-        'Container agent error',
+    if (
+      output.status === 'success' &&
+      typeof output.result === 'string' &&
+      API_ERROR_RE.test(output.result.trim())
+    ) {
+      sawApiError = true;
+      cachedApiError = output;
+      logger.warn(
+        { group: group.name, text: output.result.trim() },
+        'SDK API socket error in stream; suppressing for retry',
       );
+      return;
+    }
+
+    if (onOutput) await onOutput(output);
+  };
+
+  let lastOutput: ContainerOutput | null = null;
+  for (let attempt = 0; attempt <= MAX_API_RETRIES; attempt++) {
+    sawApiError = false;
+    try {
+      lastOutput = await runContainerAgent(
+        group,
+        {
+          prompt,
+          sessionId: sessions[group.folder],
+          groupFolder: group.folder,
+          chatJid,
+          isMain,
+          assistantName: ASSISTANT_NAME,
+        },
+        (proc, containerName) =>
+          queue.registerProcess(chatJid, proc, containerName, group.folder),
+        wrappedOnOutput,
+      );
+    } catch (err) {
+      logger.error({ group: group.name, err }, 'Agent error');
       return 'error';
     }
 
-    return 'success';
-  } catch (err) {
-    logger.error({ group: group.name, err }, 'Agent error');
+    if (lastOutput.newSessionId) {
+      sessions[group.folder] = lastOutput.newSessionId;
+      setSession(group.folder, lastOutput.newSessionId);
+    }
+
+    if (!sawApiError) break;
+
+    if (attempt < MAX_API_RETRIES) {
+      logger.info(
+        {
+          group: group.name,
+          attempt: attempt + 1,
+          maxRetries: MAX_API_RETRIES,
+        },
+        'Retrying after SDK API socket error',
+      );
+      await new Promise((r) =>
+        setTimeout(r, RETRY_BACKOFF_MS[attempt] ?? 5_000),
+      );
+    }
+  }
+
+  if (sawApiError && cachedApiError && onOutput) {
+    logger.error(
+      { group: group.name, retries: MAX_API_RETRIES },
+      'SDK API socket error persisted after retries; surfacing to user',
+    );
+    await onOutput(cachedApiError);
+  }
+
+  if (!lastOutput || lastOutput.status === 'error') {
+    logger.error(
+      { group: group.name, error: lastOutput?.error },
+      'Container agent error',
+    );
     return 'error';
   }
+  return 'success';
 }
 
 async function startMessageLoop(): Promise<void> {
