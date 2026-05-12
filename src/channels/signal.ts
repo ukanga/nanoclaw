@@ -641,7 +641,12 @@ export class SignalChannel implements Channel {
           }
         }
       } catch (err) {
-        logger.error({ jid, err }, 'Signal: send failed');
+        // Surface the failure to the caller so it can mark the message as
+        // undelivered. Logging "Signal message sent" below would be a lie
+        // and leads the agent's session to believe the user received text
+        // they never saw.
+        logger.error({ jid, chunkIndex: i, err }, 'Signal: send failed');
+        throw err;
       }
     }
 
