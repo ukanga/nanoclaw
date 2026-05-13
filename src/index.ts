@@ -485,6 +485,7 @@ async function runAgent(
 
   let cachedApiError: ContainerOutput | null = null;
   let sawApiError = false;
+  let forceClosedForRotation = false;
 
   const wrappedOnOutput = async (output: ContainerOutput) => {
     if (output.newSessionId) {
@@ -508,17 +509,23 @@ async function runAgent(
 
     if (onOutput) await onOutput(output);
 
-    // If the agent reports idle (status:success, result:null) and the session
-    // has crossed the rotation threshold, force-close the container now
-    // instead of waiting up to IDLE_TIMEOUT. This lets runAgent return so
-    // the post-reply rotation in processGroupMessages can actually run.
-    // Normal under-threshold turns keep the existing 30-min idle window
-    // for IPC follow-ups.
+    // After the agent emits a successful result (its reply to the user),
+    // if the session has crossed the rotation threshold, force-close the
+    // container now instead of waiting up to IDLE_TIMEOUT. This lets
+    // runAgent return so the post-reply rotation in processGroupMessages
+    // can actually run. Normal under-threshold turns keep the existing
+    // 30-min idle window for IPC follow-ups.
+    //
+    // Note: with MessageStream mode the SDK keeps the for-await loop
+    // alive after each turn awaiting more input, so the "{result:null}"
+    // idle marker only fires after _close is already received — we
+    // trigger on the agent's reply event instead.
     if (
+      !forceClosedForRotation &&
       output.status === 'success' &&
-      output.result === null &&
       isSessionOverThreshold(group.folder, sessions[group.folder])
     ) {
+      forceClosedForRotation = true;
       logger.info(
         { group: group.name, folder: group.folder },
         'Session over rotation threshold, closing container to allow rotation',
