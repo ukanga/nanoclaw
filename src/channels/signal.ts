@@ -659,8 +659,7 @@ export class SignalChannel implements Channel {
           try {
             await signalRpc(this.baseUrl, 'send', params);
           } catch (styledErr) {
-            const errMsg =
-              styledErr instanceof Error ? styledErr.message : '';
+            const errMsg = styledErr instanceof Error ? styledErr.message : '';
             const isTextStyleRejection =
               textStyles.length > 0 &&
               (errMsg.includes('textStyle') ||
@@ -680,10 +679,7 @@ export class SignalChannel implements Channel {
           break;
         } catch (err) {
           lastErr = err;
-          if (
-            !isRetryableSendError(err) ||
-            attempt >= MAX_SEND_RETRIES
-          ) {
+          if (!isRetryableSendError(err) || attempt >= MAX_SEND_RETRIES) {
             break;
           }
           const delay = SEND_BACKOFF_MS[attempt] ?? 5_000;
