@@ -429,8 +429,7 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
     group,
     chatJid,
     sessionId: sessions[group.folder],
-    setTyping: (on) =>
-      channel.setTyping?.(chatJid, on) ?? Promise.resolve(),
+    setTyping: (on) => channel.setTyping?.(chatJid, on) ?? Promise.resolve(),
     runAgent: (p, cb) => runAgent(group, p, chatJid, cb),
   });
 

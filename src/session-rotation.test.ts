@@ -104,7 +104,9 @@ describe('maybeAutoRotateSession', () => {
 
     const events: string[] = [];
     const runAgent = vi.fn(async (prompt: string) => {
-      events.push(`runAgent:${prompt.startsWith('/compact') ? 'compact' : 'continuation'}`);
+      events.push(
+        `runAgent:${prompt.startsWith('/compact') ? 'compact' : 'continuation'}`,
+      );
       return 'success' as const;
     });
     const setTyping = vi.fn(async (on: boolean) => {
@@ -207,7 +209,9 @@ describe('maybeAutoRotateSession', () => {
       setTyping,
       runAgent: runAgent as unknown as (
         prompt: string,
-        onOutput?: (o: import('./container-runner.js').ContainerOutput) => Promise<void>,
+        onOutput?: (
+          o: import('./container-runner.js').ContainerOutput,
+        ) => Promise<void>,
       ) => Promise<'success' | 'error'>,
     });
 

@@ -23,9 +23,7 @@ export function sessionFilePath(folder: string, sessionId: string): string {
 export function getAutoCompactThresholdBytes(): number {
   const raw = process.env.AUTO_COMPACT_THRESHOLD_BYTES;
   const n = raw ? parseInt(raw, 10) : AUTO_COMPACT_DEFAULT_THRESHOLD_BYTES;
-  return Number.isFinite(n) && n > 0
-    ? n
-    : AUTO_COMPACT_DEFAULT_THRESHOLD_BYTES;
+  return Number.isFinite(n) && n > 0 ? n : AUTO_COMPACT_DEFAULT_THRESHOLD_BYTES;
 }
 
 /**

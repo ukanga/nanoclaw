@@ -13,9 +13,7 @@ describe('session-files', () => {
   let projectRoot: string;
 
   beforeEach(() => {
-    projectRoot = fs.mkdtempSync(
-      path.join(os.tmpdir(), 'session-files-test-'),
-    );
+    projectRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'session-files-test-'));
     process.env.NANOCLAW_PROJECT_ROOT = projectRoot;
     delete process.env.AUTO_COMPACT_THRESHOLD_BYTES;
   });

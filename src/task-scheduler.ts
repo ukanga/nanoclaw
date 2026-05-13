@@ -410,4 +410,3 @@ export function startAttachmentCleanupLoop(): void {
 export function _resetAttachmentCleanupForTests(): void {
   attachmentCleanupRunning = false;
 }
-
