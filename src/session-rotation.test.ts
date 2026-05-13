@@ -3,7 +3,10 @@ import * as os from 'node:os';
 import * as path from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-import { maybeAutoRotateSession } from './session-rotation.js';
+import {
+  isSessionOverThreshold,
+  maybeAutoRotateSession,
+} from './session-rotation.js';
 import { RegisteredGroup } from './types.js';
 
 const FOLDER = 'team-rot';
@@ -31,6 +34,43 @@ function writeSession(projectRoot: string, bytes: number): string {
   fs.writeFileSync(file, 'x'.repeat(bytes));
   return file;
 }
+
+describe('isSessionOverThreshold', () => {
+  let projectRoot: string;
+
+  beforeEach(() => {
+    projectRoot = fs.mkdtempSync(
+      path.join(os.tmpdir(), 'is-over-threshold-test-'),
+    );
+    process.env.NANOCLAW_PROJECT_ROOT = projectRoot;
+    delete process.env.AUTO_COMPACT_THRESHOLD_BYTES;
+  });
+
+  afterEach(() => {
+    delete process.env.NANOCLAW_PROJECT_ROOT;
+    delete process.env.AUTO_COMPACT_THRESHOLD_BYTES;
+    fs.rmSync(projectRoot, { recursive: true, force: true });
+  });
+
+  it('returns false when sessionId is undefined', () => {
+    expect(isSessionOverThreshold(FOLDER, undefined)).toBe(false);
+  });
+
+  it('returns false when the session file does not exist', () => {
+    expect(isSessionOverThreshold(FOLDER, SESSION_ID)).toBe(false);
+  });
+
+  it('returns false when the session is under the threshold', () => {
+    writeSession(projectRoot, 10_000);
+    expect(isSessionOverThreshold(FOLDER, SESSION_ID)).toBe(false);
+  });
+
+  it('returns true when the session is at or over the threshold', () => {
+    process.env.AUTO_COMPACT_THRESHOLD_BYTES = '1000';
+    writeSession(projectRoot, 5000);
+    expect(isSessionOverThreshold(FOLDER, SESSION_ID)).toBe(true);
+  });
+});
 
 describe('maybeAutoRotateSession', () => {
   let projectRoot: string;

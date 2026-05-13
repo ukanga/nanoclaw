@@ -71,7 +71,10 @@ import {
   handleSessionCommand,
   isSessionCommandAllowed,
 } from './session-commands.js';
-import { maybeAutoRotateSession } from './session-rotation.js';
+import {
+  isSessionOverThreshold,
+  maybeAutoRotateSession,
+} from './session-rotation.js';
 import {
   startAttachmentCleanupLoop,
   startSchedulerLoop,
@@ -504,6 +507,24 @@ async function runAgent(
     }
 
     if (onOutput) await onOutput(output);
+
+    // If the agent reports idle (status:success, result:null) and the session
+    // has crossed the rotation threshold, force-close the container now
+    // instead of waiting up to IDLE_TIMEOUT. This lets runAgent return so
+    // the post-reply rotation in processGroupMessages can actually run.
+    // Normal under-threshold turns keep the existing 30-min idle window
+    // for IPC follow-ups.
+    if (
+      output.status === 'success' &&
+      output.result === null &&
+      isSessionOverThreshold(group.folder, sessions[group.folder])
+    ) {
+      logger.info(
+        { group: group.name, folder: group.folder },
+        'Session over rotation threshold, closing container to allow rotation',
+      );
+      queue.closeStdin(chatJid);
+    }
   };
 
   let lastOutput: ContainerOutput | null = null;

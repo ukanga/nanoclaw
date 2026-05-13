@@ -28,6 +28,29 @@ Keep the whole section under 200 words. Use the Edit tool. Do not respond
 with anything else — the next step will compact the session.
 </internal>`;
 
+/**
+ * Quick threshold check without running the rotation. Used by the
+ * orchestrator's streaming callback to decide whether to force-close the
+ * container immediately after the agent's reply (so the post-reply
+ * `maybeAutoRotateSession` call can actually run instead of waiting up
+ * to IDLE_TIMEOUT for the container to exit on its own).
+ */
+export function isSessionOverThreshold(
+  folder: string,
+  sessionId: string | undefined,
+): boolean {
+  if (!sessionId) return false;
+  const file = sessionFilePath(folder, sessionId);
+  if (!fs.existsSync(file)) return false;
+  try {
+    const totalBytes = fs.statSync(file).size;
+    const liveBytes = liveSessionBytes(file, totalBytes);
+    return liveBytes >= getAutoCompactThresholdBytes();
+  } catch {
+    return false;
+  }
+}
+
 export interface MaybeAutoRotateSessionOpts {
   group: RegisteredGroup;
   chatJid: string;
