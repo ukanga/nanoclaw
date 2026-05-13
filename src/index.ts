@@ -71,10 +71,10 @@ import {
   handleSessionCommand,
   isSessionCommandAllowed,
 } from './session-commands.js';
+import { maybeAutoRotateSession } from './session-rotation.js';
 import {
   startAttachmentCleanupLoop,
   startSchedulerLoop,
-  startSessionWarningLoop,
 } from './task-scheduler.js';
 import { Channel, NewMessage, RegisteredGroup } from './types.js';
 import { logger } from './logger.js';
@@ -421,6 +421,18 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
     );
     return false;
   }
+
+  // Post-reply rotation: if the session crossed the byte threshold, rotate
+  // now so the next batch lands on a fresh session. Runs synchronously
+  // within the per-group message loop, so no new batch can race in.
+  await maybeAutoRotateSession({
+    group,
+    chatJid,
+    sessionId: sessions[group.folder],
+    setTyping: (on) =>
+      channel.setTyping?.(chatJid, on) ?? Promise.resolve(),
+    runAgent: (p, cb) => runAgent(group, p, chatJid, cb),
+  });
 
   return true;
 }
@@ -877,24 +889,6 @@ async function main(): Promise<void> {
     },
   });
   startAttachmentCleanupLoop();
-  startSessionWarningLoop({
-    registeredGroups: () => registeredGroups,
-    sendMessage: async (jid, text) => {
-      const channel = findChannel(channels, jid);
-      if (!channel) {
-        logger.warn(
-          { jid },
-          'Session warning: no channel for main group, dropping',
-        );
-        return;
-      }
-      try {
-        await channel.sendMessage(jid, text);
-      } catch (err) {
-        logger.error({ jid, err }, 'Session warning send failed');
-      }
-    },
-  });
   startIpcWatcher({
     sendMessage: async (jid, rawText) => {
       const channel = findChannel(channels, jid);
