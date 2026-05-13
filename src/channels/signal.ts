@@ -250,6 +250,36 @@ function spawnSignalDaemon(
 
 const RPC_TIMEOUT_MS = 30_000;
 
+// Network-class failure signatures we retry on. signal-cli surfaces the
+// underlying JVM/HTTP error in the JSON-RPC error message; the AbortError
+// comes from our own 30s timeout on undici. All of these indicate the
+// message did not reach Signal's servers, so a retry will not duplicate.
+const RETRYABLE_SEND_PATTERNS: RegExp[] = [
+  /UnknownHostException/,
+  /SocketTimeoutException/,
+  /SocketException/i,
+  /bad_record_mac/,
+  /UND_ERR_SOCKET/,
+  /ECONNRESET/,
+  /ETIMEDOUT/,
+  /Broken pipe/,
+  /Connection reset/,
+  /aborted/i,
+  /PushNetworkException/,
+];
+const MAX_SEND_RETRIES = 2;
+const SEND_BACKOFF_MS = [2_000, 5_000];
+
+function isRetryableSendError(err: unknown): boolean {
+  const msg =
+    err instanceof Error
+      ? err.message
+      : typeof err === 'string'
+        ? err
+        : String(err);
+  return RETRYABLE_SEND_PATTERNS.some((p) => p.test(msg));
+}
+
 async function signalRpc<T = unknown>(
   baseUrl: string,
   method: string,
@@ -597,56 +627,91 @@ export class SignalChannel implements Channel {
 
     for (let i = 0; i < chunks.length; i++) {
       const chunk = chunks[i];
-      try {
-        const { text: plainText, textStyles } = parseSignalStyles(chunk);
-        const params: Record<string, unknown> = { message: plainText };
-        if (this.account) params.account = this.account;
-        // signal-cli JSON-RPC uses "textStyle" (singular) with string format "start:length:STYLE"
-        if (textStyles.length > 0) {
-          params.textStyle = textStyles.map(
-            (s) => `${s.start}:${s.length}:${s.style}`,
-          );
-        }
+      const { text: plainText, textStyles } = parseSignalStyles(chunk);
+      const params: Record<string, unknown> = { message: plainText };
+      if (this.account) params.account = this.account;
+      // signal-cli JSON-RPC uses "textStyle" (singular) with string format "start:length:STYLE"
+      if (textStyles.length > 0) {
+        params.textStyle = textStyles.map(
+          (s) => `${s.start}:${s.length}:${s.style}`,
+        );
+      }
 
-        // Attach files only to the first chunk to avoid duplicate uploads.
-        if (i === 0 && attachmentPaths.length > 0) {
-          params.attachments = attachmentPaths;
-        }
+      // Attach files only to the first chunk to avoid duplicate uploads.
+      if (i === 0 && attachmentPaths.length > 0) {
+        params.attachments = attachmentPaths;
+      }
 
-        if (target.startsWith('group:')) {
-          params.groupId = target.slice('group:'.length);
-        } else {
-          params.recipient = [target];
-        }
+      if (target.startsWith('group:')) {
+        params.groupId = target.slice('group:'.length);
+      } else {
+        params.recipient = [target];
+      }
 
+      // Retry only the specific network-class failures we've seen drop
+      // messages silently (DNS, TLS, undici/JVM socket aborts). signal-cli
+      // returns an error on these *before* a Signal-server ack, so retrying
+      // is safe — the message has not been delivered. We deliberately do NOT
+      // retry generic errors (invalid group id, missing attachment, etc).
+      let lastErr: unknown = null;
+      for (let attempt = 0; attempt <= MAX_SEND_RETRIES; attempt++) {
         try {
-          await signalRpc(this.baseUrl, 'send', params);
-        } catch (styledErr) {
-          // Only retry without styles when the error clearly indicates
-          // textStyle is unsupported (older signal-cli). Do NOT retry on
-          // timeouts or network errors — signal-cli may have already
-          // delivered the message, and retrying would send a duplicate.
-          const errMsg = styledErr instanceof Error ? styledErr.message : '';
-          const isTextStyleRejection =
-            textStyles.length > 0 &&
-            (errMsg.includes('textStyle') ||
-              errMsg.includes('Unknown parameter'));
-          if (isTextStyleRejection) {
-            logger.debug('Signal: textStyle rejected, retrying without styles');
-            delete params.textStyle;
-            params.message = plainText;
+          try {
             await signalRpc(this.baseUrl, 'send', params);
-          } else {
-            throw styledErr;
+          } catch (styledErr) {
+            const errMsg =
+              styledErr instanceof Error ? styledErr.message : '';
+            const isTextStyleRejection =
+              textStyles.length > 0 &&
+              (errMsg.includes('textStyle') ||
+                errMsg.includes('Unknown parameter'));
+            if (isTextStyleRejection) {
+              logger.debug(
+                'Signal: textStyle rejected, retrying without styles',
+              );
+              delete params.textStyle;
+              params.message = plainText;
+              await signalRpc(this.baseUrl, 'send', params);
+            } else {
+              throw styledErr;
+            }
           }
+          lastErr = null;
+          break;
+        } catch (err) {
+          lastErr = err;
+          if (
+            !isRetryableSendError(err) ||
+            attempt >= MAX_SEND_RETRIES
+          ) {
+            break;
+          }
+          const delay = SEND_BACKOFF_MS[attempt] ?? 5_000;
+          logger.warn(
+            {
+              jid,
+              chunkIndex: i,
+              attempt: attempt + 1,
+              maxRetries: MAX_SEND_RETRIES,
+              delayMs: delay,
+              err: err instanceof Error ? err.message : String(err),
+            },
+            'Signal: transient send error, retrying',
+          );
+          await new Promise((r) => setTimeout(r, delay));
         }
-      } catch (err) {
+      }
+
+      if (lastErr) {
         // Surface the failure to the caller so it can mark the message as
         // undelivered. Logging "Signal message sent" below would be a lie
         // and leads the agent's session to believe the user received text
         // they never saw.
-        logger.error({ jid, chunkIndex: i, err }, 'Signal: send failed');
-        throw err;
+        logger.error(
+          { jid, chunkIndex: i, err: lastErr },
+          'Signal: send failed',
+        );
+        throw lastErr;
       }
     }
 
