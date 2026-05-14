@@ -1037,53 +1037,62 @@ describe('SignalChannel', () => {
         },
       );
 
-      // Should not throw — error is caught internally
-      await channel.sendMessage('signal:+15555550123', 'Hello **world**');
+      try {
+        // sendMessage propagates the failure so the caller can mark the
+        // message undelivered; the key assertion is that there is no retry.
+        await expect(
+          channel.sendMessage('signal:+15555550123', 'Hello **world**'),
+        ).rejects.toThrow(/aborted/i);
 
-      // Should have made only 1 RPC call — no retry on timeout
-      const rpcCalls = mockFetch.mock.calls.filter((c) =>
-        (c[0] as string).includes('/api/v1/rpc'),
-      );
-      expect(rpcCalls.length).toBe(1);
+        // Should have made only 1 RPC call — no retry on timeout.
+        const rpcCalls = mockFetch.mock.calls.filter((c) =>
+          (c[0] as string).includes('/api/v1/rpc'),
+        );
+        expect(rpcCalls.length).toBe(1);
+      } finally {
+        // Restore the default mock even if the assertion above throws,
+        // otherwise subsequent tests' SSE setup breaks.
+        mockFetch.mockImplementation(
+          async (input: string | URL | Request, init?: RequestInit) => {
+            const url =
+              typeof input === 'string'
+                ? input
+                : input instanceof URL
+                  ? input.toString()
+                  : (input as Request).url;
+            if (url.includes('/api/v1/check'))
+              return new Response('OK', { status: 200 });
+            if (url.includes('/api/v1/rpc')) {
+              const body = JSON.parse(init?.body as string);
+              return new Response(
+                JSON.stringify({
+                  jsonrpc: '2.0',
+                  id: body.id,
+                  result: { ok: true },
+                }),
+                {
+                  status: 200,
+                  headers: { 'Content-Type': 'application/json' },
+                },
+              );
+            }
+            if (url.includes('/api/v1/events')) {
+              const stream = new ReadableStream<Uint8Array>({
+                start(controller) {
+                  fetchRef.sseController = controller;
+                },
+              });
+              return new Response(stream, {
+                status: 200,
+                headers: { 'Content-Type': 'text/event-stream' },
+              });
+            }
+            return new Response('Not Found', { status: 404 });
+          },
+        );
 
-      // Restore default mock
-      mockFetch.mockImplementation(
-        async (input: string | URL | Request, init?: RequestInit) => {
-          const url =
-            typeof input === 'string'
-              ? input
-              : input instanceof URL
-                ? input.toString()
-                : (input as Request).url;
-          if (url.includes('/api/v1/check'))
-            return new Response('OK', { status: 200 });
-          if (url.includes('/api/v1/rpc')) {
-            const body = JSON.parse(init?.body as string);
-            return new Response(
-              JSON.stringify({
-                jsonrpc: '2.0',
-                id: body.id,
-                result: { ok: true },
-              }),
-              { status: 200, headers: { 'Content-Type': 'application/json' } },
-            );
-          }
-          if (url.includes('/api/v1/events')) {
-            const stream = new ReadableStream<Uint8Array>({
-              start(controller) {
-                fetchRef.sseController = controller;
-              },
-            });
-            return new Response(stream, {
-              status: 200,
-              headers: { 'Content-Type': 'text/event-stream' },
-            });
-          }
-          return new Response('Not Found', { status: 404 });
-        },
-      );
-
-      await channel.disconnect();
+        await channel.disconnect();
+      }
     });
   });
 

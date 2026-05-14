@@ -251,9 +251,11 @@ function spawnSignalDaemon(
 const RPC_TIMEOUT_MS = 30_000;
 
 // Network-class failure signatures we retry on. signal-cli surfaces the
-// underlying JVM/HTTP error in the JSON-RPC error message; the AbortError
-// comes from our own 30s timeout on undici. All of these indicate the
-// message did not reach Signal's servers, so a retry will not duplicate.
+// underlying JVM/HTTP error in the JSON-RPC error message; these indicate
+// the message did not reach Signal's servers, so a retry will not duplicate.
+// NOTE: we deliberately do NOT retry on our own AbortController timeout
+// (DOMException with name='AbortError'): when our 30s timeout fires,
+// signal-cli may have already delivered, and a retry would duplicate.
 const RETRYABLE_SEND_PATTERNS: RegExp[] = [
   /UnknownHostException/,
   /SocketTimeoutException/,
@@ -264,13 +266,14 @@ const RETRYABLE_SEND_PATTERNS: RegExp[] = [
   /ETIMEDOUT/,
   /Broken pipe/,
   /Connection reset/,
-  /aborted/i,
   /PushNetworkException/,
 ];
 const MAX_SEND_RETRIES = 2;
 const SEND_BACKOFF_MS = [2_000, 5_000];
 
 function isRetryableSendError(err: unknown): boolean {
+  // Client-side timeout: delivery state is unknown, do not retry.
+  if (err instanceof Error && err.name === 'AbortError') return false;
   const msg =
     err instanceof Error
       ? err.message
