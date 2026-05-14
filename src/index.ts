@@ -388,6 +388,20 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
             'Channel sendMessage failed in streaming output',
           );
         }
+      } else if (raw.length > 0) {
+        // Agent produced output but nothing remains after <internal> stripping
+        // and attachment-marker parsing. The agent thinks it replied — surface
+        // the drop so we don't fail silently.
+        logger.warn(
+          {
+            group: group.name,
+            chatJid,
+            rawLength: raw.length,
+            cleanedLength: cleaned.length,
+            preview: raw.slice(0, 200),
+          },
+          'Agent output discarded: empty after cleaning and marker parsing',
+        );
       }
       // Only reset idle timer on actual results, not session-update markers (result: null)
       resetIdleTimer();
@@ -903,7 +917,20 @@ async function main(): Promise<void> {
       }
       const cleaned = formatOutbound(rawText);
       const { text, attachments } = extractAttachments(jid, cleaned);
-      if (!text && attachments.length === 0) return;
+      if (!text && attachments.length === 0) {
+        if (rawText.length > 0) {
+          logger.warn(
+            {
+              jid,
+              rawLength: rawText.length,
+              cleanedLength: cleaned.length,
+              preview: rawText.slice(0, 200),
+            },
+            'Scheduler output discarded: empty after cleaning and marker parsing',
+          );
+        }
+        return;
+      }
       try {
         await channel.sendMessage(
           jid,
@@ -921,7 +948,19 @@ async function main(): Promise<void> {
       const channel = findChannel(channels, jid);
       if (!channel) throw new Error(`No channel for JID: ${jid}`);
       const { text, attachments } = extractAttachments(jid, rawText);
-      if (!text && attachments.length === 0) return;
+      if (!text && attachments.length === 0) {
+        if (rawText.length > 0) {
+          logger.warn(
+            {
+              jid,
+              rawLength: rawText.length,
+              preview: rawText.slice(0, 200),
+            },
+            'IPC output discarded: empty after marker parsing',
+          );
+        }
+        return;
+      }
       await channel.sendMessage(
         jid,
         text,
