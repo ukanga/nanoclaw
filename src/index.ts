@@ -56,6 +56,11 @@ import {
   parseAttachmentMarkers,
 } from './router.js';
 import {
+  drainDeliveryFailures,
+  formatDeliveryFailureBlock,
+  recordDeliveryFailure,
+} from './delivery-failures.js';
+import {
   restoreRemoteControl,
   startRemoteControl,
   stopRemoteControl,
@@ -329,7 +334,18 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
     }
   }
 
-  const prompt = formatMessages(missedMessages, TIMEZONE);
+  const baseMessages = formatMessages(missedMessages, TIMEZONE);
+  const failures = drainDeliveryFailures(chatJid);
+  const prompt =
+    failures.length > 0
+      ? formatDeliveryFailureBlock(failures) + baseMessages
+      : baseMessages;
+  if (failures.length > 0) {
+    logger.info(
+      { chatJid, failureCount: failures.length },
+      'Replaying delivery failures to agent on this turn',
+    );
+  }
 
   // Advance cursor so the piping path in startMessageLoop won't re-fetch
   // these messages. Save the old cursor so we can roll back on error.
@@ -387,6 +403,10 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
             { chatJid, err },
             'Channel sendMessage failed in streaming output',
           );
+          // Surface the failure to the agent on its next turn so its
+          // worldview doesn't diverge from reality. The host caught the
+          // error; the agent's session doesn't know unless we tell it.
+          recordDeliveryFailure(chatJid, cleaned, err);
         }
       } else if (raw.length > 0) {
         // Agent produced output but nothing remains after <internal> stripping
