@@ -268,8 +268,8 @@ const RETRYABLE_SEND_PATTERNS: RegExp[] = [
   /Connection reset/,
   /PushNetworkException/,
 ];
-const MAX_SEND_RETRIES = 2;
 const SEND_BACKOFF_MS = [2_000, 5_000];
+const ATTACHMENT_SEND_BACKOFF_MS = [2_000, 5_000, 15_000, 30_000];
 
 function isRetryableSendError(err: unknown): boolean {
   // Client-side timeout: delivery state is unknown, do not retry.
@@ -657,8 +657,13 @@ export class SignalChannel implements Channel {
       // returns an error on these *before* a Signal-server ack, so retrying
       // is safe — the message has not been delivered. We deliberately do NOT
       // retry generic errors (invalid group id, missing attachment, etc).
+      const sendBackoffMs =
+        attachmentPaths.length > 0
+          ? ATTACHMENT_SEND_BACKOFF_MS
+          : SEND_BACKOFF_MS;
+      const maxSendRetries = sendBackoffMs.length;
       let lastErr: unknown = null;
-      for (let attempt = 0; attempt <= MAX_SEND_RETRIES; attempt++) {
+      for (let attempt = 0; attempt <= maxSendRetries; attempt++) {
         try {
           try {
             await signalRpc(this.baseUrl, 'send', params);
@@ -683,16 +688,16 @@ export class SignalChannel implements Channel {
           break;
         } catch (err) {
           lastErr = err;
-          if (!isRetryableSendError(err) || attempt >= MAX_SEND_RETRIES) {
+          if (!isRetryableSendError(err) || attempt >= maxSendRetries) {
             break;
           }
-          const delay = SEND_BACKOFF_MS[attempt] ?? 5_000;
+          const delay = sendBackoffMs[attempt] ?? 5_000;
           logger.warn(
             {
               jid,
               chunkIndex: i,
               attempt: attempt + 1,
-              maxRetries: MAX_SEND_RETRIES,
+              maxRetries: maxSendRetries,
               delayMs: delay,
               err: err instanceof Error ? err.message : String(err),
             },

@@ -1554,6 +1554,118 @@ describe('SignalChannel', () => {
       await channel.disconnect();
     });
 
+    it('uses an extended retry budget for transient attachment send failures', async () => {
+      const filePath = makeFile('report.pdf');
+      const channel = createChannel();
+      await channel.connect();
+      mockFetch.mockClear();
+
+      let sendCalls = 0;
+      mockFetch.mockImplementation(
+        async (input: string | URL | Request, init?: RequestInit) => {
+          const url =
+            typeof input === 'string'
+              ? input
+              : input instanceof URL
+                ? input.toString()
+                : (input as Request).url;
+
+          if (url.includes('/api/v1/check')) {
+            return new Response('OK', { status: 200 });
+          }
+
+          if (url.includes('/api/v1/rpc')) {
+            const body = JSON.parse(init?.body as string);
+            if (body.method === 'send') {
+              sendCalls++;
+              if (sendCalls <= 4) {
+                return new Response(
+                  JSON.stringify({
+                    jsonrpc: '2.0',
+                    id: body.id,
+                    error: {
+                      message:
+                        'Failed to send message: javax.net.ssl.SSLException: (bad_record_mac) Received fatal alert: bad_record_mac (PushNetworkException)',
+                    },
+                  }),
+                  {
+                    status: 200,
+                    headers: { 'Content-Type': 'application/json' },
+                  },
+                );
+              }
+            }
+
+            return new Response(
+              JSON.stringify({
+                jsonrpc: '2.0',
+                id: body.id,
+                result: { ok: true },
+              }),
+              { status: 200, headers: { 'Content-Type': 'application/json' } },
+            );
+          }
+
+          return new Response('Not Found', { status: 404 });
+        },
+      );
+
+      vi.useFakeTimers();
+      try {
+        const sendPromise = channel.sendMessage(
+          'signal:+15555550123',
+          'Here it is',
+          [filePath],
+        );
+        await vi.runAllTimersAsync();
+        await sendPromise;
+
+        expect(sendCalls).toBe(5);
+      } finally {
+        vi.useRealTimers();
+        mockFetch.mockImplementation(
+          async (input: string | URL | Request, init?: RequestInit) => {
+            const url =
+              typeof input === 'string'
+                ? input
+                : input instanceof URL
+                  ? input.toString()
+                  : (input as Request).url;
+            if (url.includes('/api/v1/check'))
+              return new Response('OK', { status: 200 });
+            if (url.includes('/api/v1/rpc')) {
+              const body = JSON.parse(init?.body as string);
+              return new Response(
+                JSON.stringify({
+                  jsonrpc: '2.0',
+                  id: body.id,
+                  result: { ok: true },
+                }),
+                {
+                  status: 200,
+                  headers: { 'Content-Type': 'application/json' },
+                },
+              );
+            }
+            if (url.includes('/api/v1/events')) {
+              const stream = new ReadableStream<Uint8Array>({
+                start(controller) {
+                  fetchRef.sseController = controller;
+                },
+              });
+              return new Response(stream, {
+                status: 200,
+                headers: { 'Content-Type': 'text/event-stream' },
+              });
+            }
+            return new Response('Not Found', { status: 404 });
+          },
+        );
+
+        await channel.disconnect();
+      }
+    });
+
     it('forwards multiple attachments in one send call', async () => {
       const a = makeFile('a.pdf');
       const b = makeFile('b.xlsx');
