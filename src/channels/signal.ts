@@ -605,12 +605,13 @@ export class SignalChannel implements Channel {
 
     this.echoCache.remember(outText);
 
-    // Deduplicate: skip if the same text was sent to the same JID recently.
+    // Deduplicate: skip if the same text and attachments were sent to the same JID recently.
     // This prevents double-sends when both streaming output and IPC send_message
     // fire for the same agent response, or when the styled-send retry triggers
     // after the first send already delivered the message.
     const DEDUP_TTL_MS = 5_000;
-    const dedupeKey = `${jid}:${outText.trim()}`;
+    const attachmentDedupeKey = attachmentPaths.join('\0');
+    const dedupeKey = `${jid}:${outText.trim()}:${attachmentDedupeKey}`;
     const now = Date.now();
     const lastSent = this.recentSends.get(dedupeKey);
     if (lastSent && now - lastSent < DEDUP_TTL_MS) {

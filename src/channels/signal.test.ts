@@ -1502,9 +1502,11 @@ describe('SignalChannel', () => {
     function allSendPayloads(): Record<string, unknown>[] {
       return mockFetch.mock.calls
         .filter((c) => String(c[0]).includes('/api/v1/rpc'))
-        .map((c) => {
+        .flatMap((c) => {
           const body = JSON.parse((c[1] as RequestInit).body as string);
-          return body.params as Record<string, unknown>;
+          return body.method === 'send'
+            ? [body.params as Record<string, unknown>]
+            : [];
         });
     }
 
@@ -1530,6 +1532,24 @@ describe('SignalChannel', () => {
       const params = lastSendPayload();
       expect(params.message).toBe('Here it is');
       expect(params.attachments).toEqual([filePath]);
+
+      await channel.disconnect();
+    });
+
+    it('does not dedupe an attachment send after the same text was sent without attachments', async () => {
+      const filePath = makeFile('report.pdf');
+      const channel = createChannel();
+      await channel.connect();
+
+      await channel.sendMessage('signal:+15555550123', 'Here it is');
+      await channel.sendMessage('signal:+15555550123', 'Here it is', [
+        filePath,
+      ]);
+
+      const sends = allSendPayloads();
+      expect(sends).toHaveLength(2);
+      expect(sends[0].attachments).toBeUndefined();
+      expect(sends[1].attachments).toEqual([filePath]);
 
       await channel.disconnect();
     });
