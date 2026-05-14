@@ -271,6 +271,19 @@ const RETRYABLE_SEND_PATTERNS: RegExp[] = [
 const SEND_BACKOFF_MS = [2_000, 5_000];
 const ATTACHMENT_SEND_BACKOFF_MS = [2_000, 5_000, 15_000, 30_000];
 
+// Subset of retryable errors that indicate signal-cli's push connection to
+// Signal's servers is dead. signal-cli's ReceiveHelper reconnects internally
+// (it logs "Connection closed unexpectedly, reconnecting in 100 ms"), but the
+// actual reconnect takes several seconds under load. Retrying inside that
+// window keeps hitting the same broken socket. We floor the retry delay on
+// these errors so the reconnect can land before our next attempt.
+const STALE_CONNECTION_PATTERNS: RegExp[] = [
+  /bad_record_mac/,
+  /Broken pipe/,
+  /PushNetworkException/,
+];
+const STALE_CONNECTION_MIN_DELAY_MS = 15_000;
+
 function isRetryableSendError(err: unknown): boolean {
   // Client-side timeout: delivery state is unknown, do not retry.
   if (err instanceof Error && err.name === 'AbortError') return false;
@@ -281,6 +294,16 @@ function isRetryableSendError(err: unknown): boolean {
         ? err
         : String(err);
   return RETRYABLE_SEND_PATTERNS.some((p) => p.test(msg));
+}
+
+function isStaleConnectionError(err: unknown): boolean {
+  const msg =
+    err instanceof Error
+      ? err.message
+      : typeof err === 'string'
+        ? err
+        : String(err);
+  return STALE_CONNECTION_PATTERNS.some((p) => p.test(msg));
 }
 
 async function signalRpc<T = unknown>(
@@ -691,7 +714,11 @@ export class SignalChannel implements Channel {
           if (!isRetryableSendError(err) || attempt >= maxSendRetries) {
             break;
           }
-          const delay = sendBackoffMs[attempt] ?? 5_000;
+          const baseDelay = sendBackoffMs[attempt] ?? 5_000;
+          const stale = isStaleConnectionError(err);
+          const delay = stale
+            ? Math.max(baseDelay, STALE_CONNECTION_MIN_DELAY_MS)
+            : baseDelay;
           logger.warn(
             {
               jid,
@@ -699,6 +726,7 @@ export class SignalChannel implements Channel {
               attempt: attempt + 1,
               maxRetries: maxSendRetries,
               delayMs: delay,
+              stale,
               err: err instanceof Error ? err.message : String(err),
             },
             'Signal: transient send error, retrying',

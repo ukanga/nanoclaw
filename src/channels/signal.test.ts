@@ -1666,6 +1666,127 @@ describe('SignalChannel', () => {
       }
     });
 
+    it('floors retry delay to 15s on stale-connection errors (bad_record_mac)', async () => {
+      const channel = createChannel();
+      await channel.connect();
+      mockFetch.mockClear();
+
+      let sendCalls = 0;
+      mockFetch.mockImplementation(
+        async (input: string | URL | Request, init?: RequestInit) => {
+          const url =
+            typeof input === 'string'
+              ? input
+              : input instanceof URL
+                ? input.toString()
+                : (input as Request).url;
+
+          if (url.includes('/api/v1/check')) {
+            return new Response('OK', { status: 200 });
+          }
+
+          if (url.includes('/api/v1/rpc')) {
+            const body = JSON.parse(init?.body as string);
+            if (body.method === 'send') {
+              sendCalls++;
+              if (sendCalls === 1) {
+                return new Response(
+                  JSON.stringify({
+                    jsonrpc: '2.0',
+                    id: body.id,
+                    error: {
+                      message:
+                        'Failed to send message: javax.net.ssl.SSLException: (bad_record_mac) Received fatal alert: bad_record_mac (PushNetworkException)',
+                    },
+                  }),
+                  {
+                    status: 200,
+                    headers: { 'Content-Type': 'application/json' },
+                  },
+                );
+              }
+            }
+
+            return new Response(
+              JSON.stringify({
+                jsonrpc: '2.0',
+                id: body.id,
+                result: { ok: true },
+              }),
+              { status: 200, headers: { 'Content-Type': 'application/json' } },
+            );
+          }
+
+          return new Response('Not Found', { status: 404 });
+        },
+      );
+
+      vi.useFakeTimers();
+      try {
+        const sendPromise = channel.sendMessage('signal:+15555550123', 'hello');
+
+        // Let the first send attempt resolve.
+        await vi.advanceTimersByTimeAsync(0);
+        await Promise.resolve();
+        await Promise.resolve();
+        expect(sendCalls).toBe(1);
+
+        // The base SEND_BACKOFF_MS[0] is 2s. Without the stale-connection
+        // floor, the retry would have fired by now. Verify it has NOT.
+        await vi.advanceTimersByTimeAsync(14_000);
+        expect(sendCalls).toBe(1);
+
+        // Crossing 15s should trigger the retry.
+        await vi.advanceTimersByTimeAsync(2_000);
+        await vi.runAllTimersAsync();
+        await sendPromise;
+
+        expect(sendCalls).toBe(2);
+      } finally {
+        vi.useRealTimers();
+        mockFetch.mockImplementation(
+          async (input: string | URL | Request, init?: RequestInit) => {
+            const url =
+              typeof input === 'string'
+                ? input
+                : input instanceof URL
+                  ? input.toString()
+                  : (input as Request).url;
+            if (url.includes('/api/v1/check'))
+              return new Response('OK', { status: 200 });
+            if (url.includes('/api/v1/rpc')) {
+              const body = JSON.parse(init?.body as string);
+              return new Response(
+                JSON.stringify({
+                  jsonrpc: '2.0',
+                  id: body.id,
+                  result: { ok: true },
+                }),
+                {
+                  status: 200,
+                  headers: { 'Content-Type': 'application/json' },
+                },
+              );
+            }
+            if (url.includes('/api/v1/events')) {
+              const stream = new ReadableStream<Uint8Array>({
+                start(controller) {
+                  fetchRef.sseController = controller;
+                },
+              });
+              return new Response(stream, {
+                status: 200,
+                headers: { 'Content-Type': 'text/event-stream' },
+              });
+            }
+            return new Response('Not Found', { status: 404 });
+          },
+        );
+
+        await channel.disconnect();
+      }
+    });
+
     it('forwards multiple attachments in one send call', async () => {
       const a = makeFile('a.pdf');
       const b = makeFile('b.xlsx');
