@@ -193,13 +193,24 @@ function buildVolumeMounts(
     'agent-runner-src',
   );
   if (fs.existsSync(agentRunnerSrc)) {
-    const srcIndex = path.join(agentRunnerSrc, 'index.ts');
-    const cachedIndex = path.join(groupAgentRunnerDir, 'index.ts');
+    // Compare the newest mtime across the *whole* canonical tree against the
+    // cache. The previous version only checked `index.ts`, so an upstream
+    // edit to any other file (e.g. `ipc-mcp-stdio.ts`) would silently leave
+    // a stale cache in place and the container would compile the old source.
+    const maxMtimeMs = (dir: string): number => {
+      let max = 0;
+      for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+        const p = path.join(dir, entry.name);
+        const stat = entry.isDirectory()
+          ? maxMtimeMs(p)
+          : fs.statSync(p).mtimeMs;
+        if (stat > max) max = stat;
+      }
+      return max;
+    };
     const needsCopy =
       !fs.existsSync(groupAgentRunnerDir) ||
-      !fs.existsSync(cachedIndex) ||
-      (fs.existsSync(srcIndex) &&
-        fs.statSync(srcIndex).mtimeMs > fs.statSync(cachedIndex).mtimeMs);
+      maxMtimeMs(agentRunnerSrc) > maxMtimeMs(groupAgentRunnerDir);
     if (needsCopy) {
       fs.cpSync(agentRunnerSrc, groupAgentRunnerDir, { recursive: true });
     }
