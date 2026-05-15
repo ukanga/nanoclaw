@@ -41,9 +41,9 @@ const server = new McpServer({
 
 server.tool(
   'send_message',
-  "Send a message to the user or group immediately while you're still running. Use this for progress updates or to send multiple messages. You can call this multiple times.",
+  "Send a message to the user or group immediately while you're still running. Use this for progress updates or to send multiple messages. You can call this multiple times. The `text` is processed the same way as your final reply: `[[attach:/workspace/group/<file>]]` markers are stripped from the text and the referenced file is sent as an attachment. To deliver multiple files as separate bubbles (e.g. one file per bubble), call this once per file with the marker inside.",
   {
-    text: z.string().describe('The message text to send'),
+    text: z.string().describe('The message text to send. Supports `[[attach:/workspace/group/<file>]]` markers — each call becomes one channel message with the referenced file attached.'),
     sender: z.string().optional().describe('Your role/identity name (e.g. "Researcher"). When set, messages appear from a dedicated bot in Telegram.'),
   },
   async (args) => {

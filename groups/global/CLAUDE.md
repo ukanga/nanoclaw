@@ -57,7 +57,9 @@ Here's the revised budget.
 [[attach:/workspace/group/outbox/budget-2026-revised.xlsx]]
 ```
 
-Multiple `[[attach:...]]` tokens in one reply are allowed; each becomes its own attachment. A reply may be attachment-only (no text). Paths must start with `/workspace/group/` — anything outside the group is rejected. Files under `inbox/` and `outbox/` are auto-deleted after 30 days (configurable via `ATTACHMENT_RETENTION_DAYS`).
+Multiple `[[attach:...]]` tokens in one reply are allowed; all of the referenced files are bundled into a **single** Signal message (one bubble with multiple files). If you want each file in its own bubble — e.g. the user asked you to share four files separately — call `mcp__nanoclaw__send_message` once per file, each call containing its own `[[attach:...]]` marker (with or without a caption). Each `send_message` call becomes its own Signal bubble. Do this within a single turn; don't wait for the user to prompt between files.
+
+A reply may be attachment-only (no text). Paths must start with `/workspace/group/` — anything outside the group is rejected. Files under `inbox/` and `outbox/` are auto-deleted after 30 days (configurable via `ATTACHMENT_RETENTION_DAYS`).
 
 ## Memory
 
