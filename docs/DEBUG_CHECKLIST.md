@@ -39,6 +39,14 @@ grep -E "image found|image NOT found|image missing" logs/nanoclaw.log
 
 If you need Kubernetes enabled, set `CONTAINER_IMAGE` to an image stored in a registry that the kubelet won't GC, or raise the GC thresholds.
 
+### 5. Signal attachment download failure is silent to users
+
+**Symptoms**: User sends an image, but the agent replies as if no image was attached. Logs show `AttachmentHelper - Failed to download attachment` from signal-cli and NanoClaw stores the message with `attachmentCount: 0`.
+
+**Cause**: signal-cli can fail to download the attachment blob from Signal's CDN and leave a 0-byte placeholder in `~/.local/share/signal-cli/attachments`. NanoClaw correctly skips the empty file, but the user only sees the downstream agent response.
+
+**Deferred improvement**: When an inbound message had attachment metadata but all attachments fail materialization, send a direct channel response such as “Signal failed to download the image; please resend it” instead of silently passing a text-only message to the agent.
+
 ## Quick Status Check
 
 ```bash
