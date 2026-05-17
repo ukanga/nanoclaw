@@ -898,10 +898,46 @@ export function createSignalAdapter(config: {
       } else {
         params.recipient = [platformId];
       }
-      await tcp.rpc('send', params);
+
+      // Attachment sends get a longer retry budget than text sends. Push
+      // connections drop more often when the host is uploading bytes, and
+      // signal-cli's ReceiveHelper needs several seconds under load before
+      // the next attempt has a fresh socket. See ATTACHMENT_SEND_BACKOFF_MS.
+      const maxRetries = ATTACHMENT_SEND_BACKOFF_MS.length;
+      let lastErr: unknown = null;
+      for (let attempt = 0; attempt <= maxRetries; attempt++) {
+        try {
+          await tcp.rpc('send', params);
+          lastErr = null;
+          break;
+        } catch (err) {
+          lastErr = err;
+          if (!isRetryableSendError(err) || attempt >= maxRetries) break;
+          const delay = ATTACHMENT_SEND_BACKOFF_MS[attempt]!;
+          log.warn('Signal: transient attachment send error, retrying', {
+            platformId,
+            count: files.length,
+            attempt: attempt + 1,
+            maxRetries,
+            delayMs: delay,
+            err: errMessage(err),
+          });
+          await sleepMs(delay);
+        }
+      }
+
+      if (lastErr) {
+        // Propagate so src/delivery.ts records the failure rather than
+        // silently dropping bytes the user paid for in upload time.
+        log.error('Signal: attachment send failed', {
+          platformId,
+          count: files.length,
+          err: errMessage(lastErr),
+        });
+        throw lastErr;
+      }
+
       log.info('Signal attachments sent', { platformId, count: files.length, filenames: files.map((f) => f.filename) });
-    } catch (err) {
-      log.error('Signal: attachment send failed', { platformId, count: files.length, err });
     } finally {
       for (const p of tempPaths) {
         try {
