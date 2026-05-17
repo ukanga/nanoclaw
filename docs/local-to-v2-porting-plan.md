@@ -273,26 +273,173 @@ These local commits should **not** be carried forward:
 ## 7. Cutover sequence (live install → `local-v2`)
 
 `local-v2` is at v1 feature parity as of step 13 (`929597b`, 2026-05-17). The
-live install on `local` is still v1. To switch:
+live install on `local` is still v1.
 
-1. Stop the v1 service before migrating, otherwise the migration runs against a moving target.
-   - Linux: `systemctl --user stop nanoclaw.service`
-   - macOS: `launchctl unload ~/Library/LaunchAgents/com.nanoclaw.plist`
-2. Run the DB migration (`bash migrate-v2.sh` or `/migrate-from-v1` from inside Claude Code) to bring DB, sessions, scheduled tasks, and group folders forward to the v2 layout.
-3. OneCLI is already in place per `MEMORY.md` (no `/init-onecli` rerun needed).
-4. Re-apply the Signal channel skill (`/add-signal`) so the v2 adapter registers.
-5. Wire the Signal agent to `cli/local` (`/init-cli-agent` or `/manage-channels`) so the new `claw` (`929597b`) reaches the same agent your Signal chats hit. Without this, `claw "hello"` hangs at "no reply" — see SKILL.md.
-6. Confirm service name change: launchd label is now `com.nanoclaw-v2-<slug>` and systemd unit is `nanoclaw-v2-<slug>.service` (slug = `sha1(projectRoot)[:8]`). The step 10 helper scripts (`scripts/group-activity.sh`, `scripts/group-context-size.sh`, `scripts/reset-group-session.sh`) key off folder names, not service names — they're portable; the rotation cron should reference the new unit.
-7. Start the v2 service:
-   - Linux: `systemctl --user start nanoclaw-v2-<slug>.service`
-   - macOS: `launchctl load ~/Library/LaunchAgents/com.nanoclaw-v2-<slug>.plist`
+> **Reality check before you start.** `v2:CLAUDE.md:9` instructs Claude to
+> tell users to run `bash migrate-v2.sh`, but that script **does not exist**
+> in the codebase. There is no automated v1→v2 data migration. The v1 data
+> shapes (`registered_groups` + `messages` + `scheduled_tasks` in
+> `store/messages.db`) don't map cleanly to v2 (`agent_groups` +
+> `messaging_groups` + `messaging_group_agents` + per-session inbound/
+> outbound DBs in `data/v2.db` and `data/v2-sessions/`). The realistic path
+> is a fresh-start cutover that preserves `groups/<folder>/` filesystems
+> (the agent workspaces — CLAUDE.md, scratch, skills) and rewires the
+> channel topology from a v1 DB snapshot via the dedicated migration
+> script committed as `c9b95a3` on `local-v2`. Chat history and v1
+> scheduled tasks do not come along.
+
+For this install the slug is `7037baf1` (`sha1("/home/ukanga/code/nanoclaw")[:8]`),
+so the v2 systemd unit is `nanoclaw-v2-7037baf1.service` and the container
+image base is `nanoclaw-agent-v2-7037baf1`.
+
+### 7.1 Pre-flight backup
+
+```bash
+cd /home/ukanga/code/nanoclaw
+systemctl --user stop nanoclaw.service                  # v1, may already be inactive
+git tag pre-v2-cutover-$(date +%Y%m%d-%H%M%S)
+tar -czf ~/nanoclaw-v1-backup-$(date +%Y%m%d).tgz store/ groups/ data/ .env
+```
+
+### 7.2 Switch branches
+
+```bash
+git worktree remove /tmp/nanoclaw-signal-pr
+git checkout local-v2
+```
+
+The worktree must be removed first — git refuses to check out a branch that's checked out elsewhere.
+
+### 7.3 Move v1 + stale-v2 artifacts aside
+
+The user's `data/` already has crufty v2 artifacts from earlier dev experiments (empty `v2.db`, stale sockets, WAL files). Move them out of the way, keep the v1 snapshot accessible for the migration script.
+
+```bash
+mv store store.v1-backup
+mv data data.v1-backup
+mkdir -p data
+```
+
+### 7.4 Install deps + build (pnpm)
+
+```bash
+pnpm install
+pnpm run build
+```
+
+The 6 pre-existing tsc errors in `src/channels/{deltachat,slack,telegram,signal.test}.ts` (confirmed unchanged through step 12) don't block runtime — your install only loads the Signal channel. If `tsc` won't complete, run with `--skipLibCheck` or accept the partial `dist/`.
+
+### 7.5 Run v2 setup
+
+```bash
+pnpm run setup
+```
+
+Walks timezone, install-slug confirmation, channels (pick Signal), OneCLI wiring (already configured — should detect), mount-allowlist, and **installs the new systemd unit `nanoclaw-v2-7037baf1.service`** (replaces v1's `nanoclaw.service`). Disable the v1 unit afterwards to keep it from racing on next login:
+
+```bash
+systemctl --user disable nanoclaw.service
+```
+
+### 7.6 Re-add Signal channel
+
+```bash
+bash setup/add-signal.sh
+```
+
+Your dedicated Signal number (`ASSISTANT_HAS_OWN_NUMBER=true`) is picked up from `.env`. Daemon credentials live outside the NanoClaw checkout, so no re-registration of the Signal account.
+
+### 7.7 Rewire v1 groups (the missing migration step)
+
+`local-v2:scripts/migrate-v1-groups.ts` (committed in `c9b95a3`) reads the v1 `registered_groups` snapshot and recreates the matching v2 entities (`agent_groups` + `messaging_groups` + `messaging_group_agents`). Idempotent — re-runs skip already-created rows. Dry-run first:
+
+```bash
+pnpm exec tsx scripts/migrate-v1-groups.ts --src store.v1-backup/messages.db
+# review the planned rows…
+pnpm exec tsx scripts/migrate-v1-groups.ts --src store.v1-backup/messages.db --apply
+```
+
+The script maps:
+
+- `signal:<phone>` (DM) → `messaging_groups(channel=signal, platform_id=<phone>, is_group=0)` wired with `engage_mode='pattern'` + `engage_pattern='.'` (every message wakes the agent — matches v1 DM behaviour).
+- `signal:group:<id>` → `messaging_groups(channel=signal, platform_id=group:<id>, is_group=1)` wired with `engage_mode='mention-sticky'` (wakes on name mention, stays engaged — matches v1 mention triggers).
+- `cli:*` → `agent_groups` row only; the messaging-group side is skipped. Wire to `cli/local` in step 7.8.
+
+For this install the script will create 7 `agent_groups`, 6 `messaging_groups`, 6 wirings, and skip 1 row (`cli:main`).
+
+### 7.8 Wire `cli/local`
+
+For `claw` (`929597b`) to talk to the same agent that answers your Signal messages, an existing `agent_groups` row needs an additional `messaging_group_agents` row wiring it to `cli/local`. Two options:
+
+- **Reuse the Signal-Main agent** — preferred, since you want `claw "..."` to hit the same Nini. Use `/manage-channels` interactively to create the wiring (target: `cli/local`, agent: `signal_main`).
+- **Fresh CLI agent** — `pnpm exec tsx scripts/init-cli-agent.ts --display-name "Ukang'a" --agent-name "Nini"`. Creates a separate `cli-with-ukanga` agent group. Use this only if you want a distinct context from your Signal Nini.
+
+Without this step, `claw "hi"` will time out (`no reply in 300s`) — the SKILL.md troubleshooting section explains why.
+
+### 7.9 Install the v2 claw script
+
+The skill ships the new script template; the install copy at `scripts/claw` may still be the v1 version. Refresh it:
+
+```bash
+cp .claude/skills/claw/scripts/claw scripts/claw
+chmod +x scripts/claw
+```
+
+`~/bin/claw` is already a symlink to `scripts/claw`. Verify with `claw --list-groups` — should show the messaging groups from step 7.7 plus the cli/local wiring from step 7.8.
+
+### 7.10 Recreate scheduled tasks
+
+The 3 v1 `scheduled_tasks` rows (in `store.v1-backup/messages.db`) don't map directly to v2's scheduling module. Read them out for reference:
+
+```bash
+sqlite3 store.v1-backup/messages.db \
+  "SELECT id, group_folder, chat_jid, schedule_type, schedule_value, prompt
+   FROM scheduled_tasks WHERE status='active'"
+```
+
+Re-add by talking to the agent — it can call the v2 scheduling MCP tool to recreate them.
+
+### 7.11 Start the v2 service, verify
+
+```bash
+systemctl --user start nanoclaw-v2-7037baf1.service
+journalctl --user -u nanoclaw-v2-7037baf1.service -f --since "1 min ago"
+claw "hello"          # exercises cli/local wiring
+# also send a Signal message — should still work
+```
+
+### 7.12 Update any rotation cron
+
+The step 10 helper scripts (`scripts/group-{activity,context-size}.sh`, `scripts/reset-group-session.sh`) key off folder names, not service names — they're portable. Any cron job that referenced `nanoclaw.service` or `store/messages.db` needs the new unit name / `data/v2.db` path.
+
+### What does and doesn't carry over
+
+| Preserved                                                              | Lost                                                                  |
+| ---------------------------------------------------------------------- | --------------------------------------------------------------------- |
+| `groups/<folder>/` (CLAUDE.md, scratch, skills) for all 7 v1 groups    | 914 messages of chat history (kept in `store.v1-backup` as a snapshot) |
+| `.env` (OneCLI URL, ASSISTANT_NAME, etc.)                              | 3 scheduled tasks (recreate from the snapshot in 7.10)                |
+| OneCLI vault (separate service)                                        | `router_state` / `chats` caches (v2 doesn't need them)                |
+| Signal daemon state (separate service, untouched)                      | Active session continuity (v2 starts fresh per-session DBs)           |
 
 ---
 
 ## 8. Rollback
 
-Backup branch: `backup/pre-update-082091e-20260517-092019`
-Backup tag: `pre-update-082091e-20260517-092019`
+Pre-port backup: branch `backup/pre-update-082091e-20260517-092019` + tag
+`pre-update-082091e-20260517-092019`. `git reset --hard <tag>` returns the
+checkout to the pre-update state.
 
-`git reset --hard pre-update-082091e-20260517-092019` returns this checkout to
-the pre-update state.
+Cutover-day rollback (after running §7):
+
+```bash
+systemctl --user stop nanoclaw-v2-7037baf1.service 2>/dev/null
+systemctl --user disable nanoclaw-v2-7037baf1.service 2>/dev/null
+git checkout local
+rm -rf data && mv data.v1-backup data
+rm -rf store && mv store.v1-backup store
+pnpm install                       # restore v1 node_modules state
+systemctl --user enable nanoclaw.service
+systemctl --user start nanoclaw.service
+```
+
+`~/nanoclaw-v1-backup-<date>.tgz` from §7.1 is the second rollback layer if the directory swap is corrupted.
