@@ -24,15 +24,15 @@ Also see `docs/BRANCH-FORK-MAINTENANCE.md` for upstream's general guidance on fo
 
 ## Architectural overview
 
-| Concern | `local` (your fork) | `main` (upstream) |
-|---|---|---|
-| Channel definition | Class instance exported from `src/channels/signal.ts`, wired in `src/index.ts` | Skill-installed adapter at `setup/channels/signal.ts`, registered via `registerChannelAdapter(name, factory)` |
-| Channel lookup | Direct reference | `src/channels/channel-registry.ts`, looked up by `channelType` |
-| Outbound delivery | Channel does its own send | Host reads files from session outbox, calls `adapter.deliver(platformId, threadId, message, files?: OutboundFile[])` |
-| Session DB | Single `messages` table with attachments column | Split: `messages_in` (host-owned) and `messages_out` (container-owned) |
-| Attachment storage | Group-rooted: `groups/<folder>/inbox/`, `groups/<folder>/outbox/` | Session-rooted: `/workspace/outbox/<messageId>/<filename>` |
-| Marker parsing | Host-side in `src/router.ts` | Must move container-side into agent-runner, since the agent-runner is what writes outbox files |
-| Existing helpers upstream | — | `src/attachment-naming.ts`, `src/attachment-safety.ts`, `src/session-manager.ts:readOutboxFiles()` |
+| Concern                   | `local` (your fork)                                                            | `main` (upstream)                                                                                                    |
+| ------------------------- | ------------------------------------------------------------------------------ | -------------------------------------------------------------------------------------------------------------------- |
+| Channel definition        | Class instance exported from `src/channels/signal.ts`, wired in `src/index.ts` | Skill-installed adapter at `setup/channels/signal.ts`, registered via `registerChannelAdapter(name, factory)`        |
+| Channel lookup            | Direct reference                                                               | `src/channels/channel-registry.ts`, looked up by `channelType`                                                       |
+| Outbound delivery         | Channel does its own send                                                      | Host reads files from session outbox, calls `adapter.deliver(platformId, threadId, message, files?: OutboundFile[])` |
+| Session DB                | Single `messages` table with attachments column                                | Split: `messages_in` (host-owned) and `messages_out` (container-owned)                                               |
+| Attachment storage        | Group-rooted: `groups/<folder>/inbox/`, `groups/<folder>/outbox/`              | Session-rooted: `/workspace/outbox/<messageId>/<filename>`                                                           |
+| Marker parsing            | Host-side in `src/router.ts`                                                   | Must move container-side into agent-runner, since the agent-runner is what writes outbox files                       |
+| Existing helpers upstream | —                                                                              | `src/attachment-naming.ts`, `src/attachment-safety.ts`, `src/session-manager.ts:readOutboxFiles()`                   |
 
 The single biggest delta: **`[[attach:…]]` marker parsing moves from the host router to the container agent-runner.** Reason: only the container can write into the session outbox before the host reads it. This inverts where the work happens but simplifies the host.
 
@@ -100,25 +100,30 @@ The single biggest delta: **`[[attach:…]]` marker parsing moves from the host 
 - **Risk:** Low.
 - **Depends on:** Unit 6.
 
-### 8. Container: parse `[[attach:…]]` in agent output (the big one)
+### 8. Container: outbound attachments via `send_file` (was: parse `[[attach:…]]`)
 
-- **What:** When the agent emits `[[attach:/workspace/group/<rel>]]` in its output, the agent-runner must:
-  1. Recognize the marker (in both buffered and streaming output).
-  2. Resolve the path, reject traversals.
-  3. Write the file (or symlink/copy) to `/workspace/outbox/<messageId>/<filename>`.
-  4. Strip the marker from the text the user sees.
-  5. Persist filenames to `messages_out` so the host can pick them up.
-- **Local:**
-  - `src/router.ts:40–70` — `parseAttachmentMarkers(text, groupFolder, groupsBaseDir)`.
-  - `src/index.ts:240–270` — `extractAttachments` closure, wired at three sites (streaming, scheduler, IPC).
-  - `bcd2270` — hoist extractAttachments to module scope so streaming can reuse it.
-- **Upstream destination:**
-  - New `container/agent-runner/src/output-parser.ts` (or extend existing parsing module) for `parseAttachmentMarkers`.
-  - Modify `container/agent-runner/src/index.ts` (the streaming/output loop) to call it on each chunk and on final output.
-  - On match: copy file into `/workspace/outbox/<messageId>/`, then write filenames into the messages_out row.
-- **Delta:** Architectural reversal. Host router does no parsing; container agent-runner becomes the producer of outbox files. Marker semantics change: the path inside `[[attach:…]]` may need to remain group-rooted (so existing agent prompts work), but the agent-runner is responsible for translating to the outbox path.
-- **Risk:** **High.** This is the load-bearing piece and where the most rework is.
-- **Depends on:** Units 1, 6, plus Open questions §2 and §4.
+- **Status:** ✅ Pre-landed upstream — no port work. v2 ships `send_file` as
+  an MCP tool (`container/agent-runner/src/mcp-tools/core.ts:134-178`), which
+  replaces the entire marker-parser approach with an explicit tool call.
+- **What v2 does instead:** the agent calls
+  `mcp__nanoclaw__send_file({ path, text?, filename?, to? })`. The handler:
+  1. Resolves `path` (absolute, or relative to `/workspace/agent/`).
+  2. Rejects missing files via `fs.existsSync`.
+  3. `fs.copyFileSync` into `/workspace/outbox/<id>/<filename>`.
+  4. Writes a `messages_out` row with
+     `content: { text, files: [filename] }`.
+     The host's `readOutboxFiles` (`src/session-manager.ts:365`) picks the
+     files up — already wired in `src/delivery.ts:350`. No streaming-marker
+     edge case to handle, because each `send_file` call is its own outbound
+     message that flushes mid-turn.
+- **Local commits this supersedes:**
+  - `6dda28b feat: parse [[attach:...]] markers from agent output`
+  - `ada48be test: cover outbound attachment send path`
+  - `bcd2270 fix: parse [[attach:]] in streaming agent output too`
+- **What still needs a one-time touch (outside this port):** any
+  `groups/*/CLAUDE.md` rules that mention `[[attach:…]]` should be rewritten
+  to instruct the agent to call `send_file`. That's a content edit per
+  install, not a code change.
 
 ### 9. Host: read outbox files into `OutboundFile[]`
 
@@ -140,36 +145,63 @@ The single biggest delta: **`[[attach:…]]` marker parsing moves from the host 
 
 ## Suggested implementation order
 
-1. **Unit 2** — Naming/safety helpers. Self-contained; small; unblocks 3.
-2. **Unit 1** — Confirm whether `messages_in.content` accepts nested attachments, schema-change if not.
-3. **Unit 3** — Inbound materialization (resolve Open question §1 first).
-4. **Unit 4** — Marker append.
-5. **Unit 5** — Inbound tests (lock down units 3–4 before touching outbound).
-6. **Unit 6** — Adapter `deliver()` files parameter. Independent of the inbound flow.
-7. **Unit 8** — Container marker parsing + outbox writes. **Highest risk; do first feature-complete pass on a side branch before merging.**
-8. **Unit 9** — Wire host's existing `readOutboxFiles` to the new agent-runner output.
-9. **Unit 7** — Outbound tests.
-10. **Unit 10** — TTL cleanup last; non-critical for correctness.
+> **2026-05-17 update:** units 1–9 are all either landed or pre-landed
+> upstream (see status notes per-unit). Only Unit 10 (TTL cleanup) remains
+> as net-new port work. Original order kept below for history.
+
+1. **Unit 2** — Naming/safety helpers. ✅ Pre-landed upstream
+   (`src/attachment-safety.ts:isSafeAttachmentName`).
+2. **Unit 1** — Confirm whether `messages_in.content` accepts nested attachments. ✅ Yes, it's a JSON blob (no migration).
+3. **Unit 3** — Inbound materialization. ✅ Landed `ea33dc9..788ec24` on `local-v2`.
+4. **Unit 4** — Marker append. ✅ Replaced by `formatter.ts:formatAttachments` rendering from `content.attachments[]`.
+5. **Unit 5** — Inbound tests. ✅ 7 cases landed in `788ec24`.
+6. **Unit 6** — Adapter `deliver()` files parameter. ✅ v2 ships it; Signal `sendAttachments` wired in step 1a.
+7. **Unit 8** — Outbound. ✅ Pre-landed upstream via `send_file` MCP tool. No marker parser needed.
+8. **Unit 9** — Host `readOutboxFiles`. ✅ Already wired (`src/delivery.ts:350`).
+9. **Unit 7** — Outbound tests. ✅ Covered by Signal `deliver` tests with `files: [...]`.
+10. **Unit 10** — TTL cleanup. ⏳ Next active piece — step 4 in the porting plan.
 
 ## Open questions (resolve before implementing each marked unit)
 
-1. **Session-id at inbound time (Unit 3).** The Signal adapter receives an inbound event but session resolution (messaging-group → agent → wiring) happens downstream in the router. Options:
-   - (a) Lazy materialization: adapter emits metadata pointing at the signal-cli cache path, router copies files post-resolution.
-   - (b) Eager materialization to a per-channel staging dir, then move into `/workspace/outbox/<messageId>/` once the messageId exists.
-   - (c) Change adapter contract so the inbound callback returns a Promise that gets the messageId injected.
-   What's the upstream intent? Pick one and stick with it.
+> **Resolution summary 2026-05-17.** v2's `send_file` MCP tool moots Q2–Q4
+> by replacing the entire marker grammar with an explicit tool call. Q1 was
+> resolved by Unit 3's landed implementation. Q5 was resolved by the same
+> commit's `content.attachments[]` shape.
 
-2. **Marker-to-DB protocol (Unit 8).** When the agent-runner finishes a turn, how does it tell the host which files belong to the outbound message? Options:
-   - New `outbound_files` column on `messages_out` (JSON array of filenames).
-   - Convention: any file present in `/workspace/outbox/<messageId>/` is part of the message.
-   - Marker-in-text: leave `[[attach:…]]` markers in the row's text and have `delivery.ts` parse them.
-   The first option is most explicit; pick before writing code.
+1. **Session-id at inbound time (Unit 3).** ✅ Resolved. The Signal adapter
+   emits `content.attachments[]` with `{ name, type, mimeType, size, data:
+<base64> }`; the host's `extractAttachmentFiles` (in `src/session-manager.ts`)
+   does the file write once `messageId` exists downstream. Adapter never
+   touches the session dir. See `src/channels/signal.ts:handleEnvelope`
+   (post-`c22f170`).
 
-3. **Chunking interaction (Units 6, 8).** Local code attaches files only to the first chunk of a split message. Upstream's `delivery.ts` may handle chunking. If it does: which chunk gets the files? (First, last, all, none-and-send-separately.) Inspect `delivery.ts` and decide.
+2. **Marker-to-DB protocol (Unit 8).** ✅ Resolved by `send_file`. The
+   container writes `messages_out.content.files: string[]` directly via the
+   MCP tool handler (`container/agent-runner/src/mcp-tools/core.ts:166-173`);
+   no `outbound_files` column, no convention scan, no in-text marker. The
+   filename list is the source of truth.
 
-4. **Marker path root (Unit 8).** Should the agent see `/workspace/group/outbox/...` (matches your existing prompts and skill instructions) or `/workspace/outbox/<messageId>/...` (matches upstream's session structure)? If the former, the agent-runner translates; if the latter, every existing agent prompt needs updating. Recommendation: keep group-rooted in the marker, translate in agent-runner.
+3. **Chunking interaction (Units 6, 8).** ✅ Resolved by `send_file`'s
+   message-per-file model. Each `send_file` call produces one
+   `messages_out` row, so chunking is irrelevant — text and files travel as
+   separate messages from the agent's perspective. Inside Signal's
+   `deliver`, the per-call shape is "send text first (chunked if needed),
+   then files" (`src/channels/signal.ts:1238-1242`), so within one row the
+   file is always attached after the text — never split across chunks.
 
-5. **`AttachmentMeta` shape.** What fields does upstream's content blob expect, if any? If the answer is "nothing yet, you're defining it," lock the schema in this doc before writing the first inbound port.
+4. **Marker path root (Unit 8).** ✅ Moot. No marker exists in v2. The
+   agent passes a file path to `send_file({ path, ... })`; the tool
+   resolves it (absolute or relative to `/workspace/agent/`) and copies
+   into `/workspace/outbox/<id>/<filename>`. Existing agent prompts that
+   referenced `[[attach:…]]` need updating to call `send_file` instead, but
+   that's a per-prompt change, not a parser config.
+
+5. **`AttachmentMeta` shape.** ✅ Resolved. Inbound:
+   `content.attachments[]` carries `{ name, type, mimeType, size, data:
+<base64>, localPath? }` — `data` is set by the adapter; `localPath` is
+   set by the host after `extractAttachmentFiles` runs. Outbound:
+   `content.files: string[]` listing filenames inside
+   `<sessionDir>/outbox/<messageId>/`.
 
 ## Verification
 

@@ -34,23 +34,23 @@ branch built from `upstream/channels` / `upstream/main`.
 
 ## 1. v2 surfaces our customizations land on
 
-| Local concept (v1) | v2 destination |
-|---|---|
-| `src/db.ts` (single file) | `src/db/` (modules + numbered migrations in `src/db/migrations/`) |
-| `src/index.ts` orchestrator monolith | `src/index.ts` + `src/modules/*` (agent-to-agent, approvals, permissions, scheduling, self-mod, typing, interactive, mount-security) |
-| `src/channels/*` in trunk | `src/channels/` + each channel ships from its own fork branch (`add-<channel>` skill); registry self-registration via `src/channels/registry.ts` |
-| `src/router.ts` (parse + dispatch) | `src/router.ts` + `src/modules/agent-to-agent/` for destination routing |
-| `src/task-scheduler.ts` | `src/modules/scheduling/` (`db.ts`, `actions.ts`, `recurrence.ts`) |
-| `src/ipc.ts` | `src/ipc.ts` (still exists, but tasks now go through modules) |
-| Per-group `agent-runner-src/` overlays | One shared read-only `container/agent-runner/` mount; per-group customization via composed `CLAUDE.md` |
-| `container/agent-runner/src/index.ts` monolith | `container/agent-runner/src/` split: `poll-loop.ts`, `mcp-tools/*`, `providers/claude.ts`, `db/*`, `formatter.ts`, `destinations.ts` |
-| `container/agent-runner/src/ipc-mcp-stdio.ts` | `container/agent-runner/src/mcp-tools/core.ts` (+ siblings per module) |
-| Container runtime: Node | **Bun** (entrypoint, package install, runtime) |
-| Per-group `container.json` | `container_configs` DB table (managed via `ncl groups config …`) |
-| Single shared session DB | Two-DB split: `inbound.db` (host writes, container reads) + `outbound.db` (container writes, host reads), per session |
-| Channel-level admin (`isMain`) | User-level roles (`owner` / `admin`) via `messaging_group_agents` wiring |
-| `.env` credentials → container env | OneCLI Agent Vault only (mandatory); credentials injected at request time |
-| `nanoclaw.service` (fixed name) | Per-install slugged: `nanoclaw-<sha1(projectRoot)[:8]>.service` |
+| Local concept (v1)                             | v2 destination                                                                                                                                   |
+| ---------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `src/db.ts` (single file)                      | `src/db/` (modules + numbered migrations in `src/db/migrations/`)                                                                                |
+| `src/index.ts` orchestrator monolith           | `src/index.ts` + `src/modules/*` (agent-to-agent, approvals, permissions, scheduling, self-mod, typing, interactive, mount-security)             |
+| `src/channels/*` in trunk                      | `src/channels/` + each channel ships from its own fork branch (`add-<channel>` skill); registry self-registration via `src/channels/registry.ts` |
+| `src/router.ts` (parse + dispatch)             | `src/router.ts` + `src/modules/agent-to-agent/` for destination routing                                                                          |
+| `src/task-scheduler.ts`                        | `src/modules/scheduling/` (`db.ts`, `actions.ts`, `recurrence.ts`)                                                                               |
+| `src/ipc.ts`                                   | `src/ipc.ts` (still exists, but tasks now go through modules)                                                                                    |
+| Per-group `agent-runner-src/` overlays         | One shared read-only `container/agent-runner/` mount; per-group customization via composed `CLAUDE.md`                                           |
+| `container/agent-runner/src/index.ts` monolith | `container/agent-runner/src/` split: `poll-loop.ts`, `mcp-tools/*`, `providers/claude.ts`, `db/*`, `formatter.ts`, `destinations.ts`             |
+| `container/agent-runner/src/ipc-mcp-stdio.ts`  | `container/agent-runner/src/mcp-tools/core.ts` (+ siblings per module)                                                                           |
+| Container runtime: Node                        | **Bun** (entrypoint, package install, runtime)                                                                                                   |
+| Per-group `container.json`                     | `container_configs` DB table (managed via `ncl groups config …`)                                                                                 |
+| Single shared session DB                       | Two-DB split: `inbound.db` (host writes, container reads) + `outbound.db` (container writes, host reads), per session                            |
+| Channel-level admin (`isMain`)                 | User-level roles (`owner` / `admin`) via `messaging_group_agents` wiring                                                                         |
+| `.env` credentials → container env             | OneCLI Agent Vault only (mandatory); credentials injected at request time                                                                        |
+| `nanoclaw.service` (fixed name)                | Per-install slugged: `nanoclaw-<sha1(projectRoot)[:8]>.service`                                                                                  |
 
 These mappings drive every per-feature port below.
 
@@ -60,29 +60,29 @@ These mappings drive every per-feature port below.
 
 ### 2.1 Signal channel — **Small/Medium** (revised — was Large)
 
-- **Discovered state:** `upstream/channels` already ships `src/channels/signal.ts` (983 lines), `signal.test.ts` (961 lines), and `.claude/skills/add-signal/` (SKILL.md, REMOVE.md, VERIFY.md). It implements the v2 `ChannelAdapter` contract, self-registers via `registerChannelAdapter('signal', …)` against `./channel-registry.js`, and is functionally on par with local *before* the Signal-hardening series. Live behaviours already present upstream: quote/reply context (correct `replyTo.sender`/`text` shape), `parseSignalStyles` + `textStyle` param name + `${start}:${length}:${style}` string format, typing indicators via `updateConfiguration` on connect, `EchoCache` text-only dedupe, mention resolution to display names, voice transcription via WHISPER_BIN / OPENAI_API_KEY, image attachments emitted as `[Image: <path>]`, groupV2 + legacy groupInfo, multi-platform send, message chunking.
+- **Discovered state:** `upstream/channels` already ships `src/channels/signal.ts` (983 lines), `signal.test.ts` (961 lines), and `.claude/skills/add-signal/` (SKILL.md, REMOVE.md, VERIFY.md). It implements the v2 `ChannelAdapter` contract, self-registers via `registerChannelAdapter('signal', …)` against `./channel-registry.js`, and is functionally on par with local _before_ the Signal-hardening series. Live behaviours already present upstream: quote/reply context (correct `replyTo.sender`/`text` shape), `parseSignalStyles` + `textStyle` param name + `${start}:${length}:${style}` string format, typing indicators via `updateConfiguration` on connect, `EchoCache` text-only dedupe, mention resolution to display names, voice transcription via WHISPER_BIN / OPENAI_API_KEY, image attachments emitted as `[Image: <path>]`, groupV2 + legacy groupInfo, multi-platform send, message chunking.
 - **Local deltas to contribute upstream** (per `git log upstream/channels..local -- src/channels/signal.ts`):
 
-  | Local commit | Behaviour | Status upstream |
-  |---|---|---|
-  | `d338917` | Prevent duplicate Signal messages caused by timeout retry | Missing — upstream `sendText` has no retry layer |
-  | `0d874c2` | Retry transient send failures before giving up | Missing |
-  | `43f8cfc` | Propagate send failures instead of logging false success | Missing — upstream `sendText` catches + logs, returns success |
-  | `a0fc96c` | Never retry our own AbortController timeout | Missing (presupposes the retry layer above) |
-  | `5776b7f` | Include attachments in send dedupe key | Missing — upstream `EchoCache` keys on `(platformId, text)` only |
-  | `84e4fbb` | Extend retries for attachment sends | Missing |
-  | `7c7a3e7` | Floor retry delay on stale-connection errors | Missing |
-  | `43349e9` | Include `attachmentCount` in 'Signal message sent' log | Missing (trivial) |
-  | `ba02abd` | Enable typing indicators on connect via `updateConfiguration` | ✅ Present (line 861-868) — drop, no port |
-  | `6519fd7` | Use correct `textStyle` string format | ✅ Present (line 718) — drop |
-  | `bc10c2e` | Use correct `textStyles` parameter name | ✅ Present (line 717-719, param name is `textStyle` — verify singular vs plural matches signal-cli expectations on current version) |
-  | `1bc02f2` + `e5769a1` | `parseSignalStyles` + tests | ✅ `parseSignalStyles` present; tests need to merge |
-  | `53b2799` + `313b963` | Quote/reply context + tests | ✅ Present (line 690-700 + comment) |
-  | `034ac72` | Original Signal channel | ✅ Present (in v2 form) |
-  | `62c6f36` | Avoid double extension when signal-cli id has one | Belongs to §2.2 (attachment inbound naming) |
-  | `1d8a536` | Drop 0-byte attachments from failed signal-cli downloads | Belongs to §2.2 |
-  | `0513c83`, `f82252d`, `f2c1e6a`, `51c46b6`, `ada48be`, `6279306` | Attachment materialization + markers + tests | §2.2 |
-  | `6979cf8`, `01f3879` | Prettier drift | Drop |
+  | Local commit                                                     | Behaviour                                                     | Status upstream                                                                                                                     |
+  | ---------------------------------------------------------------- | ------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------- |
+  | `d338917`                                                        | Prevent duplicate Signal messages caused by timeout retry     | Missing — upstream `sendText` has no retry layer                                                                                    |
+  | `0d874c2`                                                        | Retry transient send failures before giving up                | Missing                                                                                                                             |
+  | `43f8cfc`                                                        | Propagate send failures instead of logging false success      | Missing — upstream `sendText` catches + logs, returns success                                                                       |
+  | `a0fc96c`                                                        | Never retry our own AbortController timeout                   | Missing (presupposes the retry layer above)                                                                                         |
+  | `5776b7f`                                                        | Include attachments in send dedupe key                        | Missing — upstream `EchoCache` keys on `(platformId, text)` only                                                                    |
+  | `84e4fbb`                                                        | Extend retries for attachment sends                           | Missing                                                                                                                             |
+  | `7c7a3e7`                                                        | Floor retry delay on stale-connection errors                  | Missing                                                                                                                             |
+  | `43349e9`                                                        | Include `attachmentCount` in 'Signal message sent' log        | Missing (trivial)                                                                                                                   |
+  | `ba02abd`                                                        | Enable typing indicators on connect via `updateConfiguration` | ✅ Present (line 861-868) — drop, no port                                                                                           |
+  | `6519fd7`                                                        | Use correct `textStyle` string format                         | ✅ Present (line 718) — drop                                                                                                        |
+  | `bc10c2e`                                                        | Use correct `textStyles` parameter name                       | ✅ Present (line 717-719, param name is `textStyle` — verify singular vs plural matches signal-cli expectations on current version) |
+  | `1bc02f2` + `e5769a1`                                            | `parseSignalStyles` + tests                                   | ✅ `parseSignalStyles` present; tests need to merge                                                                                 |
+  | `53b2799` + `313b963`                                            | Quote/reply context + tests                                   | ✅ Present (line 690-700 + comment)                                                                                                 |
+  | `034ac72`                                                        | Original Signal channel                                       | ✅ Present (in v2 form)                                                                                                             |
+  | `62c6f36`                                                        | Avoid double extension when signal-cli id has one             | Belongs to §2.2 (attachment inbound naming)                                                                                         |
+  | `1d8a536`                                                        | Drop 0-byte attachments from failed signal-cli downloads      | Belongs to §2.2                                                                                                                     |
+  | `0513c83`, `f82252d`, `f2c1e6a`, `51c46b6`, `ada48be`, `6279306` | Attachment materialization + markers + tests                  | §2.2                                                                                                                                |
+  | `6979cf8`, `01f3879`                                             | Prettier drift                                                | Drop                                                                                                                                |
 
 - **v2 integration target (the actual scope):**
   - **Step 1a — Signal send retry + dedupe** (landed on `local-v2`, commits `c75e279..762864d`, 6 commits on top of `upstream/channels`, +427/−26): introduces a send-retry layer in `sendText` (and `sendAttachments`); uses a single dedupe key that incorporates the attachment fingerprint; propagates failures up to `deliver` so v2's `src/delivery.ts` can record them in `dropped_messages`; exempts our own `Signal RPC timeout:` errors from retry; floors retry delay on stale-connection errors; extends retry budget for attachment sends. Consolidates `d338917` + `0d874c2` + `43f8cfc` + `a0fc96c` + `5776b7f` + `84e4fbb` + `7c7a3e7`.
@@ -112,8 +112,8 @@ These mappings drive every per-feature port below.
   - `container/agent-runner/src/formatter.ts:formatAttachments` (≈ line 223) renders `content.attachments[]` to `[type: name — saved to localPath]` in the agent's XML prompt.
   - **Highest existing migration is 013** (`approval-render-metadata.ts`). Slots 014 and 015 are free. No DB migration is needed for attachment metadata — `content` is a JSON blob and accepts arbitrary nested `attachments`.
 - **v2 integration target (per-unit, cross-references `docs/attachment-port-plan.md`):**
-  - **Unit 3 (step #2) — Inbound materialization for Signal.** ✅ Landed on `local-v2` (`ea33dc9..788ec24`, 2026-05-17). `handleEnvelope` now builds `content.attachments[]` with `{ name, type, mimeType, size, data: <base64> }` for every entry in `dataMessage.attachments`; the host's `extractAttachmentFiles` does the file write. Signal-specific helpers (`findCachedAttachment`, `signalCachePlaceholderExists`, `sanitizeAttachmentName`, `MAX_ATTACHMENT_BYTES`, `CONTENT_TYPE_EXT`) live at the top of `src/channels/signal.ts`. The `[Image: <cache-path>]` inline path injection is gone — `formatAttachments` renders from `content.attachments[]`. A second guard skips `onInbound` when an envelope carried *only* attachments and every one was rejected (oversize / 0-byte placeholder / missing cache).
-  - **Unit 8 (step #3) — Marker emission/parsing.** `container/agent-runner/src/formatter.ts` + `destinations.ts` are the parsing seats; the agent-runner is responsible for copying agent-emitted files into `<sessionDir>/outbox/<messageId>/<filename>` and writing `content.files: string[]` into the row. Reuse the host's `readOutboxFiles` (already wired). Tool descriptions live in `mcp-tools/core.instructions.md`.
+  - **Unit 3 (step #2) — Inbound materialization for Signal.** ✅ Landed on `local-v2` (`ea33dc9..788ec24`, 2026-05-17). `handleEnvelope` now builds `content.attachments[]` with `{ name, type, mimeType, size, data: <base64> }` for every entry in `dataMessage.attachments`; the host's `extractAttachmentFiles` does the file write. Signal-specific helpers (`findCachedAttachment`, `signalCachePlaceholderExists`, `sanitizeAttachmentName`, `MAX_ATTACHMENT_BYTES`, `CONTENT_TYPE_EXT`) live at the top of `src/channels/signal.ts`. The `[Image: <cache-path>]` inline path injection is gone — `formatAttachments` renders from `content.attachments[]`. A second guard skips `onInbound` when an envelope carried _only_ attachments and every one was rejected (oversize / 0-byte placeholder / missing cache).
+  - **Unit 8 (step #3) — Outbound attachments.** ✅ Superseded by v2's `send_file` MCP tool (`container/agent-runner/src/mcp-tools/core.ts:134-178`, instructions at `mcp-tools/core.instructions.md:17-19`). The agent calls `mcp__nanoclaw__send_file({ path, text?, filename?, to? })` instead of emitting `[[attach:…]]` markers. The tool resolves the path (absolute or relative to `/workspace/agent/`), copies the file into `/workspace/outbox/<id>/<filename>`, and writes `{ text, files: [filename] }` into `messages_out.content`. The container `/workspace` mount points at the same dir the host's `readOutboxFiles` reads (`src/container-runner.ts:256`), so the host wiring (`src/delivery.ts:350`) consumes it as-is and passes `OutboundFile[]` to Signal's `deliver` (which now calls `sendAttachments` per step 1a). Outcome: zero marker-parser code to port. The architectural reversal `docs/attachment-port-plan.md` predicted ("marker parsing moves from host to container") landed as "marker parsing replaced by an explicit tool call" — cleaner, no parsing at all.
   - **Unit 10 (step #4) — TTL cleanup.** `src/host-sweep.ts` runs at 60s for container heartbeat only — it does **not** sweep attachment dirs today. New module `src/attachment-sweep.ts` (or fold into host-sweep) walks `<sessionDir>/inbox/` + `<sessionDir>/outbox/` and removes entries past `ATTACHMENT_RETENTION_DAYS`.
 - **DB migration:** **NO.** v2's content blob already carries attachments. (Was wrong in the earlier draft.)
 - **Dependencies:** step 1a (Signal hardening) is in. v2's destinations/formatter/extractAttachmentFiles/readOutboxFiles already merged.
@@ -161,6 +161,7 @@ Three new modules. All assume single-shared-session DB on v1; v2 has split inbou
 ### 2.8 Agent-runner reliability — **Small (cherry-pick equivalents)**
 
 Already on local from earlier cherry-picks; reapply on v2:
+
 - `eac85ae` SDK auto-retry on `Unable to connect to API` — v2 equivalent likely already exists; check `container/agent-runner/src/providers/claude.ts` and `circuit-breaker.ts`.
 - `09508f8` agent-runner exits on `_close` not just SIGKILL — check v2 `poll-loop.ts` shutdown path; reapply if missing.
 - `ee56f40` prune stale files from per-group `agent-runner-src` on every spawn — **drop**: v2 removed per-group overlays, no longer applicable.
@@ -196,25 +197,26 @@ Each row is an independent branch off `upstream/main`, mergeable on its own. Ord
 
 Integration order onto `local-v2` (built off `upstream/channels` — which already carries the Signal channel, `add-signal`, and `claw` skills). Order maximises parallelism and unblocks dependents early.
 
-| # | Integration step | Scope | Size | Status |
-|---|---|---|---|---|
-| 1a | Signal send retry + dedupe | 2.1 retry layer + propagate failures + attachment-aware dedupe + own-timeout exempt + stale-conn floor + attachment retry budget | S/M | ✅ landed `c75e279..762864d` |
-| 2 | Signal inbound attachment materialization | 2.2 unit 3 — adapter builds `content.attachments[]` with base64; host's existing `extractAttachmentFiles` does the file write. No DB migration. | M | ✅ landed `ea33dc9..788ec24` |
-| 3 | `[[attach:…]]` marker emission/parsing | 2.2 unit 8 — agent-runner-side parser; writes files into `<sessionDir>/outbox/<messageId>/`; sets `content.files`. Host's `readOutboxFiles` already wires the rest. | M | next |
-| 4 | Attachment TTL sweep | 2.2 unit 10 — new sweeper for `<sessionDir>/inbox/` + outbox dirs at `ATTACHMENT_RETENTION_DAYS`. | S |
-| 5 | Session rotation | 2.3 rotation + size helpers, adapted to two-DB split | M |
-| 6 | Session commands | 2.3 admin commands behind v2 user-roles | M |
-| 7 | Delivery replay | 2.4 — **only if** v2 `dropped_messages` doesn't already cover it | S |
-| 8 | Vendor container skills | 2.7 copy 10 container skills + sanity pass | S |
-| 9 | `claw` deltas | 2.5 diff `local:scripts/claw` against `upstream/channels:.claude/skills/claw/scripts/claw`, replay the ~105-line delta | S |
-| 10 | Helper scripts | 2.6 rewrite scripts on `ncl` | S |
-| 11 | Agent-runner reliability | 2.8 surviving items | S |
-| 12 | Docs debug checklist | 2.9 doc deltas | S |
+| #   | Integration step                          | Scope                                                                                                                                                                                                            | Size | Status                                |
+| --- | ----------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---- | ------------------------------------- |
+| 1a  | Signal send retry + dedupe                | 2.1 retry layer + propagate failures + attachment-aware dedupe + own-timeout exempt + stale-conn floor + attachment retry budget                                                                                 | S/M  | ✅ landed `c75e279..762864d`          |
+| 2   | Signal inbound attachment materialization | 2.2 unit 3 — adapter builds `content.attachments[]` with base64; host's existing `extractAttachmentFiles` does the file write. No DB migration.                                                                  | M    | ✅ landed `ea33dc9..788ec24`          |
+| 3   | Outbound attachments                      | 2.2 unit 8 — superseded by v2's `send_file` MCP tool: it writes `<sessionDir>/outbox/<messageId>/<filename>` + `content.files` directly, no marker parser needed. Host `readOutboxFiles` already wires the rest. | M    | ✅ pre-landed upstream (no port work) |
+| 4   | Attachment TTL sweep                      | 2.2 unit 10 — new sweeper for `<sessionDir>/inbox/` + outbox dirs at `ATTACHMENT_RETENTION_DAYS`.                                                                                                                | S    |
+| 5   | Session rotation                          | 2.3 rotation + size helpers, adapted to two-DB split                                                                                                                                                             | M    |
+| 6   | Session commands                          | 2.3 admin commands behind v2 user-roles                                                                                                                                                                          | M    |
+| 7   | Delivery replay                           | 2.4 — **only if** v2 `dropped_messages` doesn't already cover it                                                                                                                                                 | S    |
+| 8   | Vendor container skills                   | 2.7 copy 10 container skills + sanity pass                                                                                                                                                                       | S    |
+| 9   | `claw` deltas                             | 2.5 diff `local:scripts/claw` against `upstream/channels:.claude/skills/claw/scripts/claw`, replay the ~105-line delta                                                                                           | S    |
+| 10  | Helper scripts                            | 2.6 rewrite scripts on `ncl`                                                                                                                                                                                     | S    |
+| 11  | Agent-runner reliability                  | 2.8 surviving items                                                                                                                                                                                              | S    |
+| 12  | Docs debug checklist                      | 2.9 doc deltas                                                                                                                                                                                                   | S    |
 
-Estimated total effort: ~0 L + ~5 M + ~7 S ≈ 2–3 focused weeks (was 3–4 before the `upstream/channels` discovery).
+Estimated total effort: ~0 L + ~4 M + ~7 S ≈ 1.5–2.5 focused weeks (was 3–4 before the `upstream/channels` discovery; further trimmed 2026-05-17 when step 3 turned out to be pre-landed via `send_file`).
 
 **Integration branch:**
-- `local-v2` (off `upstream/channels`) — currently at step 1a's tip (`762864d`). Checked out in worktree `/tmp/nanoclaw-signal-pr/`. Live install on `local` continues running v1; switch over once `local-v2` reaches feature parity.
+
+- `local-v2` (off `upstream/channels`) — currently at step 2's tip (`788ec24`). Checked out in worktree `/tmp/nanoclaw-signal-pr/`. Live install on `local` continues running v1; switch over once `local-v2` reaches feature parity. Step 3 needs no code commits (pre-landed via `send_file`), so the next active integration step is #4 (TTL sweep).
 
 ---
 
@@ -227,7 +229,7 @@ Before writing code for each numbered step above, confirm the v2 surface.
 > Many v1 channels and skills already live there in v2 form.
 
 - [x] **2.1 Signal** — DONE 2026-05-17. v2 adapter lives at `upstream/channels:src/channels/signal.ts` (registered via `channel-registry.ts`, not `registry.ts`). Skill at `upstream/channels:.claude/skills/add-signal/`. Local deltas mapped in §2.1.
-- [ ] **2.2 Attachments** — read v2 `messages_in` / `messages_out` schema in `container/agent-runner/src/db/messages-in.ts` and `messages-out.ts`. Read `formatter.ts` + `destinations.ts` to see where to slot the marker code.
+- [x] **2.2 Attachments** — DONE 2026-05-17. Inbound landed (`ea33dc9..788ec24`). Outbound is **pre-landed upstream** via `send_file` (`container/agent-runner/src/mcp-tools/core.ts:134-178`) — no marker code to slot. Step 4 (TTL sweep) remains.
 - [ ] **2.3 Session rotation** — read `src/db/session-db.ts`, `src/db/sessions.ts`, and `src/session-manager.ts` to learn how sessions are sized in v2.
 - [ ] **2.4 Delivery replay** — read `src/delivery.ts` and `src/db/migrations/008-dropped-messages.ts`. If `dropped_messages.on_wake` already replays into the agent's next turn, **drop the local module**.
 - [x] **2.5 `claw`** — DONE 2026-05-17. Skill exists at `upstream/channels:.claude/skills/claw/`. Diff approach in §2.5.
@@ -262,7 +264,7 @@ Before starting branch #1, on a fresh checkout of `upstream/main`:
 ## 8. Rollback
 
 Backup branch: `backup/pre-update-082091e-20260517-092019`
-Backup tag:    `pre-update-082091e-20260517-092019`
+Backup tag: `pre-update-082091e-20260517-092019`
 
 `git reset --hard pre-update-082091e-20260517-092019` returns this checkout to
 the pre-update state.
