@@ -104,15 +104,20 @@ These mappings drive every per-feature port below.
   4. Outbound: agent emits `[[attach:…]]` markers (including in streaming output); router parses, validates, and bundles into `signal.sendMessage` `attachments` parameter.
   5. Multi-bubble behaviour: one `send_message` per file = one bubble (documented).
   6. TTL cleanup for both inbox and outbox.
-- **v2 port target:**
-  - Inbound materialization: stays in the Signal skill (where the channel knows the attachment id).
-  - Marker emission/parsing: `container/agent-runner/src/formatter.ts` + `destinations.ts` already do destination markers in v2; add attachment-marker parsing alongside. Tool descriptions live in `mcp-tools/core.instructions.md`.
-  - Metadata: probably a new column on `messages_in` / `messages_out` (the v2 names) or a sidecar table. Needs a numbered migration in `src/db/migrations/` (next free slot ≥ `016-`).
-  - TTL cleanup: separate host-side sweeper module (analogous to `src/host-sweep.ts` which v2 already ships).
-  - Group rules: rewrite for the v2 composed-`CLAUDE.md` model.
-- **DB migration:** **YES** — `016-attachment-metadata.ts` (or split into per-direction). Schema TBD; minimum is `attachment_count INT DEFAULT 0`, ideally a `message_attachments(message_id, path, mime, bytes)` table indexed by `message_id`.
-- **Dependencies:** Signal channel ported first. v2 destinations/formatter already merged.
-- **Test surface:** keep the inbound + outbound + TTL test files; rewrite to use the v2 two-DB session split.
+- **Recon 2026-05-17 — v2 already has most of the plumbing:**
+  - `src/session-manager.ts:extractAttachmentFiles` materializes base64 `content.attachments[].data` to `<sessionDir>/inbox/<messageId>/<filename>` and replaces `data` with `localPath`. Called from `writeSessionMessage`.
+  - `src/session-manager.ts:readOutboxFiles` reads outbox files into `OutboundFile[]` for delivery — already wired in `src/delivery.ts:355`.
+  - `src/attachment-naming.ts` and `src/attachment-safety.ts` exist with generic helpers (`isSafeAttachmentName`).
+  - `OutboundFile[]` is in the v2 `ChannelAdapter.deliver` signature. The Signal step-1a work already calls `sendAttachments(platformId, files)`.
+  - `container/agent-runner/src/formatter.ts:formatAttachments` (≈ line 223) renders `content.attachments[]` to `[type: name — saved to localPath]` in the agent's XML prompt.
+  - **Highest existing migration is 013** (`approval-render-metadata.ts`). Slots 014 and 015 are free. No DB migration is needed for attachment metadata — `content` is a JSON blob and accepts arbitrary nested `attachments`.
+- **v2 integration target (per-unit, cross-references `docs/attachment-port-plan.md`):**
+  - **Unit 3 (step #2) — Inbound materialization for Signal.** Refactor `src/channels/signal.ts:handleEnvelope` to build `content.attachments[]` with `{ name, type, mimeType, size, data: <base64> }` for every attachment in `dataMessage.attachments`, then let `extractAttachmentFiles` do the file write. Adopt Signal-specific helpers (`findCachedAttachment`, `signalCachePlaceholderExists`, 0-byte / oversize / double-extension guards) inside the adapter. Drop the existing `[Image: <cache-path>]` inline path injection — `formatAttachments` will produce the right rendering from `content.attachments[]`.
+  - **Unit 8 (step #3) — Marker emission/parsing.** `container/agent-runner/src/formatter.ts` + `destinations.ts` are the parsing seats; the agent-runner is responsible for copying agent-emitted files into `<sessionDir>/outbox/<messageId>/<filename>` and writing `content.files: string[]` into the row. Reuse the host's `readOutboxFiles` (already wired). Tool descriptions live in `mcp-tools/core.instructions.md`.
+  - **Unit 10 (step #4) — TTL cleanup.** `src/host-sweep.ts` runs at 60s for container heartbeat only — it does **not** sweep attachment dirs today. New module `src/attachment-sweep.ts` (or fold into host-sweep) walks `<sessionDir>/inbox/` + `<sessionDir>/outbox/` and removes entries past `ATTACHMENT_RETENTION_DAYS`.
+- **DB migration:** **NO.** v2's content blob already carries attachments. (Was wrong in the earlier draft.)
+- **Dependencies:** step 1a (Signal hardening) is in. v2's destinations/formatter/extractAttachmentFiles/readOutboxFiles already merged.
+- **Test surface:** add to `src/channels/signal.test.ts` for unit 3 cases (per-file: oversize reject, 0-byte placeholder reject, missing cache, unsafe filename, image+pdf+oversize mix, voice + transcription). New tests for the agent-runner marker parser in unit 8. Reuse host's existing extractAttachmentFiles tests as-is.
 
 ### 2.3 Session features — **Medium**
 
@@ -194,9 +199,9 @@ Integration order onto `local-v2` (built off `upstream/channels` — which alrea
 | # | Integration step | Scope | Size |
 |---|---|---|---|
 | 1a | Signal send retry + dedupe | 2.1 retry layer + propagate failures + attachment-aware dedupe + own-timeout exempt + stale-conn floor + attachment retry budget | S/M |
-| 2 | Attachment metadata | 2.2 migration `016-` + storage plumbing only (no markers yet) | M |
-| 3 | Attachment markers | 2.2 marker emission + parsing + bundling in send | M |
-| 4 | Attachment TTL sweep | 2.2 inbox/outbox TTL sweeper | S |
+| 2 | Signal inbound attachment materialization | 2.2 unit 3 — adapter builds `content.attachments[]` with base64; host's existing `extractAttachmentFiles` does the file write. No DB migration. | M |
+| 3 | `[[attach:…]]` marker emission/parsing | 2.2 unit 8 — agent-runner-side parser; writes files into `<sessionDir>/outbox/<messageId>/`; sets `content.files`. Host's `readOutboxFiles` already wires the rest. | M |
+| 4 | Attachment TTL sweep | 2.2 unit 10 — new sweeper for `<sessionDir>/inbox/` + outbox dirs at `ATTACHMENT_RETENTION_DAYS`. | S |
 | 5 | Session rotation | 2.3 rotation + size helpers, adapted to two-DB split | M |
 | 6 | Session commands | 2.3 admin commands behind v2 user-roles | M |
 | 7 | Delivery replay | 2.4 — **only if** v2 `dropped_messages` doesn't already cover it | S |
