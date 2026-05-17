@@ -58,3 +58,4 @@ import './whatsapp.js';
 
 // deltachat (native, no Chat SDK)
 // import './deltachat.js'
+import './signal.js';

@@ -91,7 +91,7 @@ RUN --mount=type=cache,target=/root/.bun/install/cache \
 #     the SDK fails at spawn time with "native binary not found".
 ENV PNPM_HOME="/pnpm"
 ENV PATH="$PNPM_HOME:$PATH"
-RUN corepack enable
+RUN corepack enable && pnpm config set global-bin-dir "$PNPM_HOME"
 
 RUN --mount=type=cache,target=/root/.cache/pnpm \
     echo "only-built-dependencies[]=agent-browser" > /root/.npmrc && \
@@ -103,6 +103,13 @@ RUN --mount=type=cache,target=/root/.cache/pnpm \
 
 RUN --mount=type=cache,target=/root/.cache/pnpm \
     pnpm install -g "@anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}"
+
+# pnpm@11 doesn't honour `only-built-dependencies` for global installs, so the
+# claude-code postinstall (which swaps the placeholder shim for the native
+# binary) is skipped. Run it explicitly. Idempotent — if the binary is already
+# in place, install.cjs just rewrites it.
+RUN D=$(ls -td /pnpm/global/v11/*/node_modules/@anthropic-ai/claude-code | head -1) && \
+    cd "$D" && node install.cjs
 
 # ---- Entrypoint --------------------------------------------------------------
 COPY entrypoint.sh /app/entrypoint.sh
