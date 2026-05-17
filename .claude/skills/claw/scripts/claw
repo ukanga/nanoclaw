@@ -19,11 +19,14 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import platform
 import re
 import sqlite3
 import subprocess
 import sys
+import tempfile
 import threading
+import urllib.request
 from pathlib import Path
 
 # ── Globals ─────────────────────────────────────────────────────────────────
@@ -65,6 +68,99 @@ SECRET_KEYS = [
     "ANTHROPIC_AUTH_TOKEN",
     "OLLAMA_HOST",
 ]
+
+DEFAULT_ONECLI_URL = "http://127.0.0.1:10254"
+
+# ── OneCLI Integration ───────────────────────────────────────────────────────
+
+def read_onecli_url(env_file: Path) -> str:
+    """Read ONECLI_URL from .env, falling back to the default."""
+    if not env_file.exists():
+        return DEFAULT_ONECLI_URL
+    for line in env_file.read_text().splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("ONECLI_URL="):
+            _, _, val = line.partition("=")
+            return val.strip() or DEFAULT_ONECLI_URL
+    return DEFAULT_ONECLI_URL
+
+
+def get_onecli_config(onecli_url: str) -> dict | None:
+    """Fetch container config from OneCLI gateway. Returns None on failure."""
+    url = f"{onecli_url}/api/container-config"
+    try:
+        req = urllib.request.Request(url, method="GET")
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            return json.loads(resp.read())
+    except Exception as e:
+        dbg(f"OneCLI unreachable ({url}): {e}")
+        return None
+
+
+# Persistent paths for CA cert files (reused across runs, cleaned up on next run)
+_CA_CERT_PATH = Path(tempfile.gettempdir()) / "onecli-gateway-ca.pem"
+_COMBINED_CA_PATH = Path(tempfile.gettempdir()) / "onecli-combined-ca.pem"
+
+# Common system CA bundle locations
+_SYSTEM_CA_PATHS = [
+    "/etc/ssl/certs/ca-certificates.crt",
+    "/etc/pki/tls/certs/ca-bundle.crt",
+    "/etc/ssl/cert.pem",
+]
+
+
+def _build_combined_ca_bundle(ca_certificate: str) -> Path | None:
+    """Combine OneCLI CA cert with system CA bundle."""
+    system_ca = None
+    for p in _SYSTEM_CA_PATHS:
+        if os.path.isfile(p):
+            system_ca = p
+            break
+    if not system_ca:
+        return None
+    try:
+        system_certs = Path(system_ca).read_text()
+        _COMBINED_CA_PATH.write_text(system_certs.rstrip("\n") + "\n" + ca_certificate + "\n")
+        dbg(f"combined CA bundle: {_COMBINED_CA_PATH}")
+        return _COMBINED_CA_PATH
+    except Exception as e:
+        dbg(f"failed to build combined CA bundle: {e}")
+        return None
+
+
+def apply_onecli_config(cmd: list[str], onecli_url: str) -> bool:
+    """Fetch OneCLI config and add -e/-v flags to the docker run command.
+    Returns True if config was applied, False otherwise."""
+    config = get_onecli_config(onecli_url)
+    if config is None:
+        return False
+
+    # Add env vars
+    for key, value in config.get("env", {}).items():
+        cmd.extend(["-e", f"{key}={value}"])
+
+    # Write CA certificate to host and mount into container
+    ca_cert = config.get("caCertificate", "")
+    ca_container_path = config.get("caCertificateContainerPath", "/tmp/onecli-gateway-ca.pem")
+    if ca_cert:
+        _CA_CERT_PATH.write_text(ca_cert)
+        cmd.extend(["-v", f"{_CA_CERT_PATH}:{ca_container_path}:ro"])
+
+        # Build combined CA bundle so Node.js trusts both system and OneCLI CAs
+        combined = _build_combined_ca_bundle(ca_cert)
+        if combined:
+            cmd.extend(["-e", "SSL_CERT_FILE=/tmp/onecli-combined-ca.pem"])
+            cmd.extend(["-v", f"{combined}:/tmp/onecli-combined-ca.pem:ro"])
+
+    # On Linux, host.docker.internal needs explicit mapping
+    if platform.system() == "Linux":
+        cmd.extend(["--add-host=host.docker.internal:host-gateway"])
+
+    dbg("OneCLI config applied to container args")
+    return True
+
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -154,8 +250,19 @@ def build_mounts(folder: str, is_main: bool) -> list[tuple[str, str, bool]]:
 
 def run_container(runtime: str, image: str, payload: dict,
                   folder: str | None = None, is_main: bool = False,
-                  timeout: int = 300) -> None:
+                  timeout: int = 300, onecli_url: str = DEFAULT_ONECLI_URL) -> None:
     cmd = [runtime, "run", "-i", "--rm"]
+
+    # Apply OneCLI credential proxy config (env vars, CA cert mounts)
+    onecli_applied = apply_onecli_config(cmd, onecli_url)
+    if not onecli_applied:
+        # Fall back to .env secrets if OneCLI is unreachable
+        secrets = payload.get("secrets", {})
+        if secrets:
+            dbg("OneCLI unavailable, falling back to .env secrets")
+        else:
+            print("warning: OneCLI unreachable and no secrets in .env — agent may not be authenticated", file=sys.stderr)
+
     if folder:
         for host, container, readonly in build_mounts(folder, is_main):
             if readonly:
@@ -347,10 +454,8 @@ def main():
             sys.exit("error: no group specified and no main group found. Use -g or -j.")
 
     runtime = detect_runtime(args.runtime)
+    onecli_url = read_onecli_url(ENV_FILE)
     secrets = read_secrets(ENV_FILE)
-
-    if not secrets:
-        print("warning: no secrets found in .env — agent may not be authenticated", file=sys.stderr)
 
     payload: dict = {
         "prompt": prompt,
@@ -367,7 +472,7 @@ def main():
     print(f"[{group_name or jid}] running via {runtime}...", file=sys.stderr)
     run_container(runtime, args.image, payload,
                   folder=group_folder, is_main=is_main,
-                  timeout=args.timeout)
+                  timeout=args.timeout, onecli_url=onecli_url)
 
 
 if __name__ == "__main__":
