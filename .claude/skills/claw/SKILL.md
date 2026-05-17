@@ -1,28 +1,33 @@
 ---
 name: claw
-description: Install the claw CLI tool — run NanoClaw agent containers from the command line without opening a chat app.
+description: Install the claw CLI tool — talk to your NanoClaw agent from the command line without opening a chat app.
 ---
 
 # claw — NanoClaw CLI
 
-`claw` is a Python CLI that sends prompts directly to a NanoClaw agent container from the terminal. It reads registered groups from the NanoClaw database, picks up secrets from `.env`, and pipes a JSON payload into a container run — no chat app required.
+`claw` is a Python CLI that talks to your running NanoClaw v2 service over
+its local Unix socket (`data/cli.sock`). It writes a JSON line per
+prompt, reads JSON replies back, and prints them to stdout.
 
 ## What it does
 
-- Send a prompt to any registered group by name, folder, or JID
-- Default target is the main group (no `-g` needed for most use)
-- Resume a previous session with `-s <session-id>`
+- Send a prompt to whichever agent is wired to `cli/local`
 - Read prompts from stdin (`--pipe`) for scripting and piping
-- List all registered groups with `--list-groups`
-- Auto-detects `container` or `docker` runtime (or override with `--runtime`)
-- Prints the agent's response to stdout; session ID to stderr
-- Verbose mode (`-v`) shows the command, redacted payload, and exit code
+- List all messaging groups and their wired agents with `--list-groups`
+- Verbose mode (`-v`) shows resolved paths and the JSON sent over the wire
 
 ## Prerequisites
 
 - Python 3.8 or later
-- NanoClaw installed with a built and tagged container image (`nanoclaw-agent:latest`)
-- Either `container` (Apple Container, macOS 15+) or `docker` available in `PATH`
+- NanoClaw v2 installed and the service running
+  (`launchctl`/`systemd` — `data/cli.sock` must exist)
+- An agent wired to `cli/local`. The CLI channel ships with main and
+  registers on service start; wire an agent to it via `/init-cli-agent`
+  or `/manage-channels`
+
+No container runtime is required: claw no longer spawns containers; it
+just speaks the CLI channel protocol to the host service, which owns
+the agent containers.
 
 ## Install
 
@@ -61,70 +66,76 @@ source ~/.zshrc   # or ~/.bashrc
 claw --list-groups
 ```
 
-You should see registered groups. If NanoClaw isn't running or the database doesn't exist yet, the list will be empty — that's fine.
+You should see the messaging groups registered on this install and
+which agent group (if any) is wired to each.
 
 ## Usage Examples
 
 ```bash
-# Send a prompt to the main group
+# Default: send a prompt to whatever is wired to cli/local
 claw "What's on my calendar today?"
 
-# Send to a specific group by name (fuzzy match)
-claw -g "family" "Remind everyone about dinner at 7"
-
-# Send to a group by exact JID
-claw -j "120363336345536173@g.us" "Hello"
-
-# Resume a previous session
-claw -s abc123 "Continue where we left off"
-
 # Read prompt from stdin
-echo "Summarize this" | claw --pipe -g dev
+echo "Summarize this" | claw --pipe
 
-# Pipe a file
+# Pipe a file with a prefix prompt
 cat report.txt | claw --pipe "Summarize this report"
 
-# List all registered groups
+# List messaging groups and their wired agents
 claw --list-groups
 
-# Force a specific runtime
-claw --runtime docker "Hello"
-
-# Use a custom image tag (e.g. after rebuilding with a new tag)
-claw --image nanoclaw-agent:dev "Hello"
-
-# Verbose mode (debug info, secrets redacted)
+# Verbose mode (debug info)
 claw -v "Hello"
 
-# Custom timeout for long-running tasks
+# Custom timeout for long-running tasks (default 300s for first reply)
 claw --timeout 600 "Run the full analysis"
 ```
 
+## Notes
+
+- **Single-client chat semantics.** The CLI channel allows one
+  concurrent terminal chat. Running `claw` while
+  `pnpm run chat` is open in another terminal evicts that chat client
+  (it will print `[superseded by a newer client]` and disconnect).
+  Two `claw` invocations from different terminals exhibit the same
+  eviction behaviour. This is by design — see the header of
+  `src/channels/cli.ts`.
+- **Socket permissions.** `data/cli.sock` is `chmod 0600`. claw must
+  run as the same uid as the NanoClaw service.
+- **v1 flags removed.** `-g/--group`, `-j/--jid`, `-s/--session`,
+  `--runtime`, and `--image` no longer apply in v2. Multi-group
+  routing goes through the channel's own chat app (or by wiring more
+  agents to `cli/local`); sessions are auto-managed by the host
+  (`src/host-sweep.ts`).
+
 ## Troubleshooting
 
-### "neither 'container' nor 'docker' found"
+### "NanoClaw CLI socket not found"
 
-Install Docker Desktop or Apple Container (macOS 15+), or pass `--runtime` explicitly.
+The service isn't running, or it's running in a different install
+directory. Start the service (`launchctl kickstart -k
+gui/$(id -u)/com.nanoclaw-v2-<slug>` on macOS, `systemctl --user
+restart nanoclaw-v2-<slug>` on Linux). If you have multiple installs,
+set `NANOCLAW_DIR` to point at the one you want to talk to.
 
-### "no secrets found in .env"
+### "timeout: no reply in 300s"
 
-The script auto-detects your NanoClaw directory and reads `.env` from it. Check that the file exists and contains at least one of: `CLAUDE_CODE_OAUTH_TOKEN`, `ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`.
+No agent is wired to `cli/local`, or the wired agent's container is
+stuck. Run `claw --list-groups` to confirm a row with channel `cli`
+and platform id `local` has an agent. Tail `logs/nanoclaw.log` for
+container/poll-loop errors; see `docs/DEBUG_CHECKLIST.md`.
 
-### Container times out
+### "[superseded by a newer client]"
 
-The default timeout is 300 seconds. For longer tasks, pass `--timeout 600` (or higher). If the container consistently hangs, check that your `nanoclaw-agent:latest` image is up to date by running `./container/build.sh`.
-
-### "group not found"
-
-Run `claw --list-groups` to see what's registered. Group lookup does a fuzzy partial match on name and folder — if your query matches multiple groups, you'll get an error listing the ambiguous matches.
-
-### Container crashes mid-stream
-
-Containers run with `--rm` so they are automatically removed. If the agent crashes before emitting the output sentinel, `claw` falls back to printing raw stdout. Use `-v` to see what the container produced. Rebuild the image with `./container/build.sh` if crashes are consistent.
+Another terminal (probably `pnpm run chat`) connected after you did.
+Reconnect — your previous prompt's reply may already be in
+`data/v2-sessions/<agent>/<session>/outbound.db` even though it never
+reached this terminal.
 
 ### Override the NanoClaw directory
 
-If `claw` can't find your database or `.env`, set the `NANOCLAW_DIR` environment variable:
+If `claw` can't find your install (you have multiple checkouts, or
+you're running from outside the repo), set `NANOCLAW_DIR`:
 
 ```bash
 export NANOCLAW_DIR=/path/to/your/nanoclaw

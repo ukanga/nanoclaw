@@ -1,17 +1,23 @@
 #!/usr/bin/env python3
 """
-claw — NanoClaw CLI
-Run a NanoClaw agent container from the command line.
+claw — NanoClaw CLI (v2)
+
+Send a prompt to your NanoClaw agent via the local CLI socket.
 
 Usage:
   claw "What is 2+2?"
-  claw -g <channel_name> "Review this code"
-  claw -g "<channel name with spaces>" "What's the latest issue?"
-  claw -j "<chatJid>" "Hello"
-  claw -g <channel_name> -s <session-id> "Continue"
+  echo "prompt text" | claw --pipe
+  cat prompt.txt | claw --pipe "Summarize this report"
   claw --list-groups
-  echo "prompt text" | claw --pipe -g <channel_name>
-  cat prompt.txt | claw --pipe
+
+The running NanoClaw service exposes a Unix socket at `data/cli.sock`.
+claw connects, writes the prompt as a single JSON line, then reads JSON
+replies until the stream goes quiet, then exits.
+
+Preconditions:
+  - NanoClaw v2 service running (launchctl/systemd).
+  - An agent group wired to the `cli/local` messaging group
+    (see `/init-cli-agent` or `/manage-channels`).
 """
 
 from __future__ import annotations
@@ -19,23 +25,23 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import platform
-import re
+import socket
 import sqlite3
-import subprocess
 import sys
-import tempfile
-import threading
-import urllib.request
+import time
 from pathlib import Path
 
 # ── Globals ─────────────────────────────────────────────────────────────────
 
 VERBOSE = False
+SILENCE_SECS = 2.0       # exit after this much quiet time following the first reply
+DEFAULT_TIMEOUT = 300    # hard wait for the first reply
+
 
 def dbg(*args):
     if VERBOSE:
         print("»", *args, file=sys.stderr)
+
 
 # ── Config ──────────────────────────────────────────────────────────────────
 
@@ -44,377 +50,206 @@ def _find_nanoclaw_dir() -> Path:
 
     Resolution order:
     1. NANOCLAW_DIR env var
-    2. The directory containing this script (if it looks like a NanoClaw install)
+    2. Walk up from this script — v2 marker is `data/cli.sock` or `data/v2.db`
     3. ~/src/nanoclaw (legacy default)
     """
     if env := os.environ.get("NANOCLAW_DIR"):
         return Path(env).expanduser()
-    # If this script lives inside the NanoClaw tree (e.g. scripts/claw), walk up
     here = Path(__file__).resolve()
-    for parent in [here.parent, here.parent.parent]:
-        if (parent / "store" / "messages.db").exists() or (parent / ".env").exists():
+    for parent in (here.parent, here.parent.parent, here.parent.parent.parent):
+        if (parent / "data" / "cli.sock").exists() or (parent / "data" / "v2.db").exists():
+            return parent
+        if (parent / ".env").exists() and (parent / "data").is_dir():
             return parent
     return Path.home() / "src" / "nanoclaw"
 
+
 NANOCLAW_DIR = _find_nanoclaw_dir()
-DB_PATH      = NANOCLAW_DIR / "store" / "messages.db"
-ENV_FILE     = NANOCLAW_DIR / ".env"
-IMAGE        = "nanoclaw-agent:latest"
-
-SECRET_KEYS = [
-    "CLAUDE_CODE_OAUTH_TOKEN",
-    "ANTHROPIC_API_KEY",
-    "ANTHROPIC_BASE_URL",
-    "ANTHROPIC_AUTH_TOKEN",
-    "OLLAMA_HOST",
-]
-
-DEFAULT_ONECLI_URL = "http://127.0.0.1:10254"
-
-# ── OneCLI Integration ───────────────────────────────────────────────────────
-
-def read_onecli_url(env_file: Path) -> str:
-    """Read ONECLI_URL from .env, falling back to the default."""
-    if not env_file.exists():
-        return DEFAULT_ONECLI_URL
-    for line in env_file.read_text().splitlines():
-        line = line.strip()
-        if not line or line.startswith("#"):
-            continue
-        if line.startswith("ONECLI_URL="):
-            _, _, val = line.partition("=")
-            return val.strip() or DEFAULT_ONECLI_URL
-    return DEFAULT_ONECLI_URL
+DATA_DIR = NANOCLAW_DIR / "data"
+SOCKET_PATH = DATA_DIR / "cli.sock"
+DB_PATH = DATA_DIR / "v2.db"
 
 
-def get_onecli_config(onecli_url: str) -> dict | None:
-    """Fetch container config from OneCLI gateway. Returns None on failure."""
-    url = f"{onecli_url}/api/container-config"
-    try:
-        req = urllib.request.Request(url, method="GET")
-        with urllib.request.urlopen(req, timeout=5) as resp:
-            return json.loads(resp.read())
-    except Exception as e:
-        dbg(f"OneCLI unreachable ({url}): {e}")
-        return None
+# ── Group listing ──────────────────────────────────────────────────────────
 
-
-# Persistent paths for CA cert files (reused across runs, cleaned up on next run)
-_CA_CERT_PATH = Path(tempfile.gettempdir()) / "onecli-gateway-ca.pem"
-_COMBINED_CA_PATH = Path(tempfile.gettempdir()) / "onecli-combined-ca.pem"
-
-# Common system CA bundle locations
-_SYSTEM_CA_PATHS = [
-    "/etc/ssl/certs/ca-certificates.crt",
-    "/etc/pki/tls/certs/ca-bundle.crt",
-    "/etc/ssl/cert.pem",
-]
-
-
-def _build_combined_ca_bundle(ca_certificate: str) -> Path | None:
-    """Combine OneCLI CA cert with system CA bundle."""
-    system_ca = None
-    for p in _SYSTEM_CA_PATHS:
-        if os.path.isfile(p):
-            system_ca = p
-            break
-    if not system_ca:
-        return None
-    try:
-        system_certs = Path(system_ca).read_text()
-        _COMBINED_CA_PATH.write_text(system_certs.rstrip("\n") + "\n" + ca_certificate + "\n")
-        dbg(f"combined CA bundle: {_COMBINED_CA_PATH}")
-        return _COMBINED_CA_PATH
-    except Exception as e:
-        dbg(f"failed to build combined CA bundle: {e}")
-        return None
-
-
-def apply_onecli_config(cmd: list[str], onecli_url: str) -> bool:
-    """Fetch OneCLI config and add -e/-v flags to the docker run command.
-    Returns True if config was applied, False otherwise."""
-    config = get_onecli_config(onecli_url)
-    if config is None:
-        return False
-
-    # Add env vars
-    for key, value in config.get("env", {}).items():
-        cmd.extend(["-e", f"{key}={value}"])
-
-    # Write CA certificate to host and mount into container
-    ca_cert = config.get("caCertificate", "")
-    ca_container_path = config.get("caCertificateContainerPath", "/tmp/onecli-gateway-ca.pem")
-    if ca_cert:
-        _CA_CERT_PATH.write_text(ca_cert)
-        cmd.extend(["-v", f"{_CA_CERT_PATH}:{ca_container_path}:ro"])
-
-        # Build combined CA bundle so Node.js trusts both system and OneCLI CAs
-        combined = _build_combined_ca_bundle(ca_cert)
-        if combined:
-            cmd.extend(["-e", "SSL_CERT_FILE=/tmp/onecli-combined-ca.pem"])
-            cmd.extend(["-v", f"{combined}:/tmp/onecli-combined-ca.pem:ro"])
-
-    # On Linux, host.docker.internal needs explicit mapping
-    if platform.system() == "Linux":
-        cmd.extend(["--add-host=host.docker.internal:host-gateway"])
-
-    dbg("OneCLI config applied to container args")
-    return True
-
-
-# ── Helpers ──────────────────────────────────────────────────────────────────
-
-def detect_runtime(preference: str | None) -> str:
-    if preference:
-        dbg(f"runtime: forced to {preference}")
-        return preference
-    for rt in ("container", "docker"):
-        result = subprocess.run(["which", rt], capture_output=True)
-        if result.returncode == 0:
-            dbg(f"runtime: auto-detected {rt} at {result.stdout.decode().strip()}")
-            return rt
-    sys.exit("error: neither 'container' nor 'docker' found. Install one or pass --runtime.")
-
-
-def read_secrets(env_file: Path) -> dict:
-    secrets = {}
-    if not env_file.exists():
-        return secrets
-    for line in env_file.read_text().splitlines():
-        line = line.strip()
-        if not line or line.startswith("#"):
-            continue
-        if "=" in line:
-            key, _, val = line.partition("=")
-            key = key.strip()
-            if key in SECRET_KEYS:
-                secrets[key] = val.strip()
-    return secrets
-
-
-def get_groups(db: Path) -> list[dict]:
-    conn = sqlite3.connect(db)
+def list_groups() -> int:
+    """Show messaging groups and which agent group is wired to each."""
+    if not DB_PATH.exists():
+        print(f"No NanoClaw v2 database found at {DB_PATH}.", file=sys.stderr)
+        return 1
+    conn = sqlite3.connect(f"file:{DB_PATH}?mode=ro", uri=True)
     rows = conn.execute(
-        "SELECT jid, name, folder, is_main FROM registered_groups ORDER BY name"
+        """
+        SELECT
+            mg.channel_type,
+            mg.platform_id,
+            mg.name,
+            ag.name AS agent_name,
+            ag.folder
+        FROM messaging_groups mg
+        LEFT JOIN messaging_group_agents mga
+            ON mga.messaging_group_id = mg.id
+        LEFT JOIN agent_groups ag
+            ON ag.id = mga.agent_group_id
+        ORDER BY mg.channel_type, mg.name
+        """
     ).fetchall()
     conn.close()
-    return [{"jid": r[0], "name": r[1], "folder": r[2], "is_main": bool(r[3])} for r in rows]
+    if not rows:
+        print("No messaging groups wired yet.", file=sys.stderr)
+        return 0
+    print(f"{'CHANNEL':<10} {'PLATFORM ID':<32} {'NAME':<24} {'AGENT':<20} FOLDER")
+    print("-" * 100)
+    for channel_type, platform_id, name, agent_name, folder in rows:
+        print(
+            f"{channel_type or '-':<10} "
+            f"{(platform_id or '-')[:32]:<32} "
+            f"{(name or '-')[:24]:<24} "
+            f"{(agent_name or '-')[:20]:<20} "
+            f"{folder or '-'}"
+        )
+    return 0
 
 
-def find_group(groups: list[dict], query: str) -> dict | None:
-    q = query.lower()
-    # Exact name match
-    for g in groups:
-        if g["name"].lower() == q or g["folder"].lower() == q:
-            return g
-    # Partial match
-    matches = [g for g in groups if q in g["name"].lower() or q in g["folder"].lower()]
-    if len(matches) == 1:
-        return matches[0]
-    if len(matches) > 1:
-        names = ", ".join(f'"{g["name"]}"' for g in matches)
-        sys.exit(f"error: ambiguous group '{query}'. Matches: {names}")
-    return None
+# ── Send + receive ──────────────────────────────────────────────────────────
 
+def send_prompt(prompt: str, timeout: int) -> int:
+    """Open `data/cli.sock`, send the prompt, stream replies to stdout."""
+    if not SOCKET_PATH.exists():
+        print(
+            f"NanoClaw CLI socket not found at {SOCKET_PATH}.\n"
+            "Start the NanoClaw service before running claw "
+            "(launchctl/systemd — see docs/DEBUG_CHECKLIST.md).",
+            file=sys.stderr,
+        )
+        return 2
 
-def build_mounts(folder: str, is_main: bool) -> list[tuple[str, str, bool]]:
-    """Return list of (host_path, container_path, readonly) tuples."""
-    groups_dir  = NANOCLAW_DIR / "groups"
-    data_dir    = NANOCLAW_DIR / "data"
-    sessions_dir = data_dir / "sessions" / folder
-    ipc_dir     = data_dir / "ipc" / folder
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        s.connect(str(SOCKET_PATH))
+    except (FileNotFoundError, ConnectionRefusedError, PermissionError) as e:
+        print(f"NanoClaw daemon not reachable at {SOCKET_PATH}: {e}", file=sys.stderr)
+        return 2
 
-    # Ensure required dirs exist
-    group_dir = groups_dir / folder
-    group_dir.mkdir(parents=True, exist_ok=True)
-    (sessions_dir / ".claude").mkdir(parents=True, exist_ok=True)
-    for sub in ("messages", "tasks", "input"):
-        (ipc_dir / sub).mkdir(parents=True, exist_ok=True)
+    payload = json.dumps({"text": prompt}) + "\n"
+    try:
+        s.sendall(payload.encode("utf-8"))
+    except OSError as e:
+        print(f"Failed to send prompt: {e}", file=sys.stderr)
+        s.close()
+        return 2
+    dbg(f"sent: {payload.strip()}")
 
-    agent_runner_src = sessions_dir / "agent-runner-src"
-    project_agent_runner = NANOCLAW_DIR / "container" / "agent-runner" / "src"
-    if not agent_runner_src.exists() and project_agent_runner.exists():
-        import shutil
-        shutil.copytree(project_agent_runner, agent_runner_src)
+    s.settimeout(timeout)
+    first_reply_seen = False
+    buffer = b""
+    deadline: float | None = None
+    exit_code = 3
 
-    mounts: list[tuple[str, str, bool]] = []
-    if is_main:
-        mounts.append((str(NANOCLAW_DIR), "/workspace/project", True))
-    mounts.append((str(group_dir),           "/workspace/group",    False))
-    mounts.append((str(sessions_dir / ".claude"), "/home/node/.claude", False))
-    mounts.append((str(ipc_dir),             "/workspace/ipc",      False))
-    if agent_runner_src.exists():
-        mounts.append((str(agent_runner_src), "/app/src",           False))
-    return mounts
-
-
-def run_container(runtime: str, image: str, payload: dict,
-                  folder: str | None = None, is_main: bool = False,
-                  timeout: int = 300, onecli_url: str = DEFAULT_ONECLI_URL) -> None:
-    cmd = [runtime, "run", "-i", "--rm"]
-
-    # Apply OneCLI credential proxy config (env vars, CA cert mounts)
-    onecli_applied = apply_onecli_config(cmd, onecli_url)
-    if not onecli_applied:
-        # Fall back to .env secrets if OneCLI is unreachable
-        secrets = payload.get("secrets", {})
-        if secrets:
-            dbg("OneCLI unavailable, falling back to .env secrets")
-        else:
-            print("warning: OneCLI unreachable and no secrets in .env — agent may not be authenticated", file=sys.stderr)
-
-    if folder:
-        for host, container, readonly in build_mounts(folder, is_main):
-            if readonly:
-                cmd += ["--mount", f"type=bind,source={host},target={container},readonly"]
-            else:
-                cmd += ["-v", f"{host}:{container}"]
-    cmd.append(image)
-    dbg(f"cmd: {' '.join(cmd)}")
-
-    # Show payload sans secrets
-    if VERBOSE:
-        safe = {k: v for k, v in payload.items() if k != "secrets"}
-        safe["secrets"] = {k: "***" for k in payload.get("secrets", {})}
-        dbg(f"payload: {json.dumps(safe, indent=2)}")
-
-    proc = subprocess.Popen(
-        cmd,
-        stdin=subprocess.PIPE,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-    )
-    dbg(f"container pid: {proc.pid}")
-
-    # Write JSON payload and close stdin
-    proc.stdin.write(json.dumps(payload).encode())
-    proc.stdin.close()
-    dbg("stdin closed, waiting for response...")
-
-    stdout_lines: list[str] = []
-    stderr_lines: list[str] = []
-    done = threading.Event()
-
-    def stream_stderr():
-        for raw in proc.stderr:
-            line = raw.decode(errors="replace").rstrip()
-            if line.startswith("npm notice"):
-                continue
-            stderr_lines.append(line)
-            print(line, file=sys.stderr)
-
-    def stream_stdout():
-        for raw in proc.stdout:
-            line = raw.decode(errors="replace").rstrip()
-            stdout_lines.append(line)
-            dbg(f"stdout: {line}")
-            # Kill the container as soon as we see the closing sentinel —
-            # the Node.js event loop often keeps the process alive indefinitely.
-            if line.strip() == "---NANOCLAW_OUTPUT_END---":
-                dbg("output sentinel found, terminating container")
-                done.set()
+    try:
+        while True:
+            try:
+                if deadline is not None:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        break
+                    s.settimeout(remaining)
+                chunk = s.recv(4096)
+            except socket.timeout:
+                if first_reply_seen:
+                    break
+                print(f"timeout: no reply in {timeout}s", file=sys.stderr)
+                return 3
+            if not chunk:
+                # Server closed the connection.
+                break
+            buffer += chunk
+            while b"\n" in buffer:
+                line, buffer = buffer.split(b"\n", 1)
+                text_line = line.decode("utf-8", errors="replace").strip()
+                if not text_line:
+                    continue
                 try:
-                    proc.terminate()
-                    try:
-                        proc.wait(timeout=5)
-                    except subprocess.TimeoutExpired:
-                        dbg("graceful stop timed out, force killing container")
-                        proc.kill()
-                except ProcessLookupError:
-                    pass
-                return
-
-    t_err = threading.Thread(target=stream_stderr, daemon=True)
-    t_out = threading.Thread(target=stream_stdout, daemon=True)
-    t_err.start()
-    t_out.start()
-
-    # Wait for sentinel or timeout
-    if not done.wait(timeout=timeout):
-        # Also check if process exited naturally
-        t_out.join(timeout=2)
-        if not done.is_set():
-            proc.kill()
-            sys.exit(f"error: container timed out after {timeout}s (no output sentinel received)")
-
-    t_err.join(timeout=5)
-    t_out.join(timeout=5)
-    proc.wait()
-    dbg(f"container done (rc={proc.returncode}), {len(stdout_lines)} stdout lines")
-    stdout = "\n".join(stdout_lines)
-
-    # Parse output block
-    match = re.search(
-        r"---NANOCLAW_OUTPUT_START---\n(.*?)\n---NANOCLAW_OUTPUT_END---",
-        stdout,
-        re.DOTALL,
-    )
-    success = False
-
-    if match:
+                    msg = json.loads(text_line)
+                except json.JSONDecodeError:
+                    dbg(f"non-JSON line ignored: {text_line}")
+                    continue
+                text = msg.get("text") if isinstance(msg, dict) else None
+                if isinstance(text, str):
+                    print(text)
+                    first_reply_seen = True
+                    deadline = time.monotonic() + SILENCE_SECS
+                    exit_code = 0
+    finally:
         try:
-            data = json.loads(match.group(1))
-            status = data.get("status", "unknown")
-            if status == "success":
-                print(data.get("result", ""))
-                session_id = data.get("newSessionId") or data.get("sessionId")
-                if session_id:
-                    print(f"\n[session: {session_id}]", file=sys.stderr)
-                success = True
-            else:
-                print(f"[{status}] {data.get('result', '')}", file=sys.stderr)
-                sys.exit(1)
-        except json.JSONDecodeError:
-            print(match.group(1))
-    else:
-        # No structured output — print raw stdout
-        print(stdout)
+            s.close()
+        except OSError:
+            pass
 
-    if success:
-        return
-
-    if proc.returncode not in (0, None):
-        sys.exit(proc.returncode)
+    return exit_code
 
 
-# ── Main ─────────────────────────────────────────────────────────────────────
+# ── Main ────────────────────────────────────────────────────────────────────
 
-def main():
+DEPRECATED_FLAGS = ("group", "jid", "session", "runtime", "image")
+
+
+def main() -> int:
     parser = argparse.ArgumentParser(
         prog="claw",
-        description="Run a NanoClaw agent from the command line.",
+        description="Send a prompt to your NanoClaw agent via the local CLI socket.",
     )
     parser.add_argument("prompt", nargs="?", help="Prompt to send")
-    parser.add_argument("-g", "--group", help="Group name or folder (fuzzy match)")
-    parser.add_argument("-j", "--jid", help="Chat JID (exact)")
-    parser.add_argument("-s", "--session", help="Session ID to resume")
-    parser.add_argument("-p", "--pipe", action="store_true",
-                        help="Read prompt from stdin (can be combined with a prompt arg as prefix)")
-    parser.add_argument("--runtime", choices=["docker", "container"],
-                        help="Container runtime (default: auto-detect)")
-    parser.add_argument("--image", default=IMAGE, help=f"Container image (default: {IMAGE})")
-    parser.add_argument("--list-groups", action="store_true", help="List registered groups and exit")
-    parser.add_argument("--raw", action="store_true", help="Print raw JSON output")
-    parser.add_argument("--timeout", type=int, default=300, metavar="SECS",
-                        help="Max seconds to wait for a response (default: 300)")
-    parser.add_argument("-v", "--verbose", action="store_true",
-                        help="Show debug info: cmd, payload (secrets redacted), stdout lines, exit code")
+    parser.add_argument(
+        "-p", "--pipe", action="store_true",
+        help="Read prompt from stdin (can be combined with a prompt arg as prefix)",
+    )
+    parser.add_argument(
+        "--list-groups", action="store_true",
+        help="List wired messaging groups and exit",
+    )
+    parser.add_argument(
+        "--timeout", type=int, default=DEFAULT_TIMEOUT, metavar="SECS",
+        help=f"Max seconds to wait for the first reply (default: {DEFAULT_TIMEOUT})",
+    )
+    parser.add_argument(
+        "-v", "--verbose", action="store_true",
+        help="Show debug info (resolved paths, sent JSON)",
+    )
+
+    # Deprecated v1 flags — kept hidden so users get a clear message instead of
+    # a generic argparse error if they invoke the old UX.
+    parser.add_argument("-g", "--group", help=argparse.SUPPRESS)
+    parser.add_argument("-j", "--jid", help=argparse.SUPPRESS)
+    parser.add_argument("-s", "--session", help=argparse.SUPPRESS)
+    parser.add_argument("--runtime", help=argparse.SUPPRESS)
+    parser.add_argument("--image", help=argparse.SUPPRESS)
+    parser.add_argument("--raw", action="store_true", help=argparse.SUPPRESS)
+
     args = parser.parse_args()
 
     global VERBOSE
     VERBOSE = args.verbose
+    dbg(f"NANOCLAW_DIR: {NANOCLAW_DIR}")
+    dbg(f"SOCKET_PATH:  {SOCKET_PATH}")
+    dbg(f"DB_PATH:      {DB_PATH}")
 
-    groups = get_groups(DB_PATH) if DB_PATH.exists() else []
+    used_deprecated = [name for name in DEPRECATED_FLAGS if getattr(args, name)]
+    if used_deprecated:
+        flags = ", ".join("--" + n for n in used_deprecated)
+        print(
+            f"claw v2: {flags} no longer supported.\n"
+            "Chat now flows through `data/cli.sock` to whichever agent is wired\n"
+            "to cli/local. To talk to a specific channel's agent, either use that\n"
+            "channel's chat app, or wire it to cli/local (see /init-cli-agent or\n"
+            "/manage-channels).",
+            file=sys.stderr,
+        )
+        return 2
 
     if args.list_groups:
-        print(f"{'NAME':<35} {'FOLDER':<30} {'JID'}")
-        print("-" * 100)
-        for g in groups:
-            main_tag = " [main]" if g["is_main"] else ""
-            print(f"{g['name']:<35} {g['folder']:<30} {g['jid']}{main_tag}")
-        return
+        return list_groups()
 
-    # Resolve prompt: --pipe reads stdin, optionally prepended with positional arg
     if args.pipe or (not sys.stdin.isatty() and not args.prompt):
         stdin_text = sys.stdin.read().strip()
         if args.prompt:
@@ -426,54 +261,10 @@ def main():
 
     if not prompt:
         parser.print_help()
-        sys.exit(1)
+        return 1
 
-    # Resolve group → jid
-    jid = args.jid
-    group_name = None
-    group_folder = None
-    is_main = False
-
-    if args.group:
-        g = find_group(groups, args.group)
-        if g is None:
-            sys.exit(f"error: group '{args.group}' not found. Run --list-groups to see options.")
-        jid = g["jid"]
-        group_name = g["name"]
-        group_folder = g["folder"]
-        is_main = g["is_main"]
-    elif not jid:
-        # Default: main group
-        mains = [g for g in groups if g["is_main"]]
-        if mains:
-            jid = mains[0]["jid"]
-            group_name = mains[0]["name"]
-            group_folder = mains[0]["folder"]
-            is_main = True
-        else:
-            sys.exit("error: no group specified and no main group found. Use -g or -j.")
-
-    runtime = detect_runtime(args.runtime)
-    onecli_url = read_onecli_url(ENV_FILE)
-    secrets = read_secrets(ENV_FILE)
-
-    payload: dict = {
-        "prompt": prompt,
-        "chatJid": jid,
-        "isMain": is_main,
-        "secrets": secrets,
-    }
-    if group_name:
-        payload["groupFolder"] = group_name
-    if args.session:
-        payload["sessionId"] = args.session
-        payload["resumeAt"] = "latest"
-
-    print(f"[{group_name or jid}] running via {runtime}...", file=sys.stderr)
-    run_container(runtime, args.image, payload,
-                  folder=group_folder, is_main=is_main,
-                  timeout=args.timeout, onecli_url=onecli_url)
+    return send_prompt(prompt, args.timeout)
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
