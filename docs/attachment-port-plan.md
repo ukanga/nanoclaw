@@ -136,18 +136,21 @@ The single biggest delta: **`[[attach:…]]` marker parsing moves from the host 
 
 ### 10. TTL cleanup
 
-- **What:** Periodic cleanup of attachment storage (default 30 days, env-overridable, hourly walk, 60s startup delay to avoid contention).
+- **Status:** ✅ Landed on `local-v2` (`517c9af`, 2026-05-17).
+- **What:** Periodic cleanup of attachment storage (default 30 days, env-overridable via `ATTACHMENT_RETENTION_DAYS`, hourly walk, 60s startup delay).
 - **Local:** `src/task-scheduler.ts` — runAttachmentCleanup, startAttachmentCleanupLoop. Walks `groups/*/inbox` and `groups/*/outbox`.
-- **Upstream destination:** New `src/attachment-cleanup.ts` (or fold into `src/session-manager.ts`). Walk session outbox roots instead of group roots.
-- **Delta:** Path roots change; algorithm identical.
-- **Risk:** Med.
-- **Depends on:** Units 3 and 8 (so there's something to clean up).
+- **v2 landing:** New module `src/attachment-sweep.ts`. Walks every `<sessionsBaseDir>/<agentGroupId>/<sessionId>/{inbox,outbox}/<messageId>/` (filesystem walk, not `getActiveSessions` — that way abandoned session dirs still get cleaned). Prunes files older than the cutoff, then removes any `messageId` subdir left empty. Parent `inbox/`/`outbox/` dirs are left in place — `initSessionFolder` owns them.
+- **Delta from v1:** Path roots moved from group-rooted (`groups/<folder>/{inbox,outbox}/`) to session-rooted with an extra `<messageId>/` level. Algorithm otherwise identical to v1's `runAttachmentCleanup`.
+- **Wiring:** `startAttachmentSweep()` called from `src/index.ts` next to `startHostSweep`; `stopAttachmentSweep()` from the shutdown path.
+- **Risk:** Med (resolved during landing — no concurrent-writer issues since `clearOutbox` only deletes per-message dirs synchronously during delivery, and TTL only touches files older than 30 days).
+- **Depends on:** Units 3 and 8 (so there's something to clean up). Both landed.
+- **Test coverage:** 18 cases in `src/attachment-sweep.test.ts` — pure helpers, per-session walker (inbox + outbox + missing subdir + mixed mtimes + empty-dir cleanup), top-level orchestrator, and the start/stop loop with fake timers.
 
 ## Suggested implementation order
 
-> **2026-05-17 update:** units 1–9 are all either landed or pre-landed
-> upstream (see status notes per-unit). Only Unit 10 (TTL cleanup) remains
-> as net-new port work. Original order kept below for history.
+> **2026-05-17 update:** All units 1–10 are landed or pre-landed upstream
+> (see status notes per-unit). Attachment port is complete on `local-v2`
+> as of `517c9af`. Original order kept below for history.
 
 1. **Unit 2** — Naming/safety helpers. ✅ Pre-landed upstream
    (`src/attachment-safety.ts:isSafeAttachmentName`).
@@ -159,7 +162,7 @@ The single biggest delta: **`[[attach:…]]` marker parsing moves from the host 
 7. **Unit 8** — Outbound. ✅ Pre-landed upstream via `send_file` MCP tool. No marker parser needed.
 8. **Unit 9** — Host `readOutboxFiles`. ✅ Already wired (`src/delivery.ts:350`).
 9. **Unit 7** — Outbound tests. ✅ Covered by Signal `deliver` tests with `files: [...]`.
-10. **Unit 10** — TTL cleanup. ⏳ Next active piece — step 4 in the porting plan.
+10. **Unit 10** — TTL cleanup. ✅ Landed `517c9af` on `local-v2` (`src/attachment-sweep.ts` + 18 tests).
 
 ## Open questions (resolve before implementing each marked unit)
 
