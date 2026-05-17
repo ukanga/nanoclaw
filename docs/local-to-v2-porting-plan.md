@@ -151,10 +151,17 @@ These mappings drive every per-feature port below.
 - **v2 port:** rewrite to read from the two-DB session split (`inbound.db` + `outbound.db`) and from `container_configs`. Reuse `ncl sessions get` / `ncl groups config get` where possible — these scripts probably collapse to small wrappers around `ncl`.
 - **DB migration:** none.
 
-### 2.7 Vendored container skills — **Small (port = copy)**
+### 2.7 Vendored container skills — **Small (port = copy)** ✅ landed `69e3c4f`
 
-- `container/skills/diagnose/`, `grill-with-docs/`, `improve-codebase-architecture/`, `prototype/`, `tdd/`, `triage/`, `to-issues/`, `to-prd/`, `zoom-out/`, `setup-matt-pocock-skills/` — 10 SKILL.md files + ~25 supporting docs, ~805 lines total
-- **v2 port target:** these are container-side skills loaded inside the agent container. v2 still has `container/skills/`. **Port = `git checkout local -- container/skills/<name>`** for each, then a sanity pass for v2 references (e.g. `nanoclaw.service` → install-slug).
+- 12 dirs / 32 files / ~2092 lines vendored from `local`: `capabilities/`, `diagnose/`, `grill-with-docs/`, `improve-codebase-architecture/`, `prototype/`, `setup-matt-pocock-skills/`, `status/`, `tdd/`, `to-issues/`, `to-prd/`, `triage/`, `zoom-out/`. (The plan's earlier list of 10 omitted `capabilities` and `status`; both are channel-installed agent-introspection skills and belong with the rest.)
+- Already on `upstream/channels` and skipped: `agent-browser/`, `frontend-engineer/`, `self-customize/`, `slack-formatting/`, `vercel-cli/`, `welcome/`.
+- **Sanity pass — v1-isms found and patched in `capabilities/SKILL.md` and `status/SKILL.md` only:**
+  - Drop "main chat" gate (v2 has no `/workspace/project` mount; no privileged main-chat concept — per-user roles handle gating).
+  - Skills mount: `/home/node/.claude/skills/` → `/app/skills/` (per `container/agent-runner/src/index.ts:20`).
+  - Workspace dirs: `/workspace/group/` → `/workspace/agent/`; drop `/workspace/extra/` and `/workspace/ipc/` (neither exists in v2).
+  - MCP tool list refreshed to v2 surface: add `send_file`, `edit_message`, `add_reaction`, `create_agent`, `ask_user_question`, `send_card`, `install_packages`, `add_mcp_server`; drop `register_group` (no longer an MCP tool in v2 — the central DB writes happen host-side).
+- The other 10 skills are channel-agnostic and ported clean — no v2 references to patch.
+- A pre-existing `/workspace/group/` reference in `slack-formatting/SKILL.md` (a v2-owned skill, not vendored) is out of scope here.
 - **DB migration:** none.
 
 ### 2.8 Agent-runner reliability — **Small (cherry-pick equivalents)**
@@ -205,17 +212,17 @@ Integration order onto `local-v2` (built off `upstream/channels` — which alrea
 | 5   | Session rotation                          | 2.3 rotation + size helpers — landed container-side as proactive `/compact` against the SDK transcript                                                                                                           | M    | ✅ landed `2ea0795`                   |
 | 6   | Session commands                          | 2.3 admin gate for `/compact` — pre-landed via `src/command-gate.ts` (gates `/clear`, `/compact`, `/context`, `/cost`, `/files` on `user_roles`)                                                                 | M    | ✅ pre-landed upstream (no port work) |
 | 7   | Delivery replay                           | 2.4 — `delivery-failure` kind written by host on permanent send failure, rendered by container as `<delivery-failures>` block on next turn                                                                       | S    | ✅ landed `db90355`                   |
-| 8   | Vendor container skills                   | 2.7 copy 10 container skills + sanity pass                                                                                                                                                                       | S    |
+| 8   | Vendor container skills                   | 2.7 copy 12 container skills + sanity pass (path/tool refresh in `capabilities` + `status`)                                                                                                                      | S    | ✅ landed `69e3c4f`                   |
 | 9   | `claw` deltas                             | 2.5 diff `local:scripts/claw` against `upstream/channels:.claude/skills/claw/scripts/claw`, replay the ~105-line delta                                                                                           | S    |
 | 10  | Helper scripts                            | 2.6 rewrite scripts on `ncl`                                                                                                                                                                                     | S    |
 | 11  | Agent-runner reliability                  | 2.8 surviving items                                                                                                                                                                                              | S    |
 | 12  | Docs debug checklist                      | 2.9 doc deltas                                                                                                                                                                                                   | S    |
 
-Estimated total effort: ~0 L + ~2 M + ~5 S ≈ 1 focused week (was 3–4 before the `upstream/channels` discovery; further trimmed 2026-05-17 when step 3 turned out to be pre-landed via `send_file`, then again when step 4 landed; trimmed again when step 5 landed as a smaller container-side change than the plan predicted; trimmed once more when step 6 turned out to be pre-landed via `src/command-gate.ts`; trimmed again when step 7 landed as a real port on top of `messages_in` rather than dropping in via a v2 mechanism that turned out not to exist).
+Estimated total effort: ~0 L + ~2 M + ~4 S ≈ 1 focused week (was 3–4 before the `upstream/channels` discovery; further trimmed 2026-05-17 when step 3 turned out to be pre-landed via `send_file`, then again when step 4 landed; trimmed again when step 5 landed as a smaller container-side change than the plan predicted; trimmed once more when step 6 turned out to be pre-landed via `src/command-gate.ts`; trimmed again when step 7 landed as a real port on top of `messages_in` rather than dropping in via a v2 mechanism that turned out not to exist; trimmed once more when step 8 landed as a mostly-mechanical vendor with a small surface-refresh on `capabilities` + `status`).
 
 **Integration branch:**
 
-- `local-v2` (off `upstream/channels`) — currently at step 7's tip (`db90355`). Checked out in worktree `/tmp/nanoclaw-signal-pr/`. Live install on `local` continues running v1; switch over once `local-v2` reaches feature parity. Steps 3 and 6 needed no code commits (pre-landed upstream via `send_file` and `command-gate.ts` respectively); steps 2, 4, 5, and 7 landed as code commits on `local-v2`. Next active integration step is #8 (vendor container skills).
+- `local-v2` (off `upstream/channels`) — currently at step 8's tip (`69e3c4f`). Checked out in worktree `/tmp/nanoclaw-signal-pr/`. Live install on `local` continues running v1; switch over once `local-v2` reaches feature parity. Steps 3 and 6 needed no code commits (pre-landed upstream via `send_file` and `command-gate.ts` respectively); steps 2, 4, 5, 7, and 8 landed as code commits on `local-v2`. Next active integration step is #9 (`claw` deltas).
 
 ---
 
