@@ -8,7 +8,7 @@
  * Ported from v1 — see v1 source for commit history.
  */
 import { execFileSync, execSync, spawn } from 'node:child_process';
-import { existsSync, readFileSync, unlinkSync, writeFileSync } from 'node:fs';
+import { existsSync, readFileSync, readdirSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
 import { createConnection, type Socket } from 'node:net';
 import { homedir, tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -17,6 +17,82 @@ import type { ChannelAdapter, ChannelSetup, InboundMessage, OutboundMessage } fr
 import { registerChannelAdapter } from './channel-registry.js';
 import { readEnvFile } from '../env.js';
 import { log } from '../log.js';
+
+// ---------------------------------------------------------------------------
+// Inbound attachment helpers
+// ---------------------------------------------------------------------------
+
+/** Per-attachment ceiling. Larger than typical Signal media (≤ 16 MB) but
+ * a defensive cap against signal-cli's local cache returning unexpectedly
+ * huge files. */
+const MAX_ATTACHMENT_BYTES = 25 * 1024 * 1024;
+
+/** ContentType → file extension. Used by sanitizeAttachmentName when the
+ * filename Signal supplied is missing or unsafe-and-replaced. */
+const CONTENT_TYPE_EXT: Record<string, string> = {
+  'image/png': '.png',
+  'image/jpeg': '.jpg',
+  'image/gif': '.gif',
+  'image/webp': '.webp',
+  'application/pdf': '.pdf',
+  'audio/mpeg': '.mp3',
+  'audio/aac': '.aac',
+  'audio/ogg': '.ogg',
+  'video/mp4': '.mp4',
+};
+
+/** Locate a cached attachment by id. signal-cli stores files in two shapes:
+ *   1. exactly `<id>` (early versions / non-mediatype attachments)
+ *   2. `<id>.<ext>` (recent versions that infer extension from MIME)
+ * 0-byte hits are rejected — signal-cli leaves empty placeholders when its
+ * blob download from `cdnX.signal.org` fails, and we don't want to forward
+ * those to the agent. Returns the path of a non-empty file or null. */
+function findCachedAttachment(cacheDir: string, id: string): string | null {
+  const direct = join(cacheDir, id);
+  if (existsSync(direct) && statSync(direct).size > 0) return direct;
+  try {
+    const matches = readdirSync(cacheDir).filter((f) => f === id || f.startsWith(`${id}.`));
+    for (const m of matches) {
+      const p = join(cacheDir, m);
+      if (statSync(p).size > 0) return p;
+    }
+  } catch {
+    /* unreadable cache dir — treated as missing */
+  }
+  return null;
+}
+
+/** Does signal-cli have *any* file for this id (including a 0-byte
+ * placeholder from a failed CDN fetch)? Lets the caller distinguish
+ * "missing entirely" from "download failed, placeholder left behind." */
+function signalCachePlaceholderExists(cacheDir: string, id: string): boolean {
+  if (existsSync(join(cacheDir, id))) return true;
+  try {
+    return readdirSync(cacheDir).some((f) => f === id || f.startsWith(`${id}.`));
+  } catch {
+    return false;
+  }
+}
+
+/** Produce a safe filename for the session inbox. Rejects path traversals
+ * and OS-special chars; falls back to `attachment-<id>[.ext]` when the
+ * Signal-supplied name is empty or fully sanitises away. The `idHasExt`
+ * branch avoids double-extensioning files like `wx58.png` whose signal-cli
+ * id already carries the right extension. */
+function sanitizeAttachmentName(filename: string | undefined, fallbackId: string, contentType: string | undefined): string {
+  const base = (filename ?? '').trim();
+  // Strip directory components and replace unsafe chars with underscores.
+  // path.basename here is defensive in case Signal ever leaks a relative
+  // path; the subsequent regex still scrubs forbidden characters.
+  const lastSegment = base.includes('/') ? base.slice(base.lastIndexOf('/') + 1) : base;
+  const cleaned = lastSegment.replace(/[^A-Za-z0-9._-]/g, '_').replace(/_+/g, '_');
+  if (!cleaned || /^[._]+$/.test(cleaned)) {
+    const idHasExt = /\.[A-Za-z0-9]+$/.test(fallbackId);
+    const ext = !idHasExt && contentType ? (CONTENT_TYPE_EXT[contentType] ?? '') : '';
+    return `attachment-${fallbackId}${ext}`;
+  }
+  return cleaned;
+}
 
 // ---------------------------------------------------------------------------
 // Signal CLI daemon management
