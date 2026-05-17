@@ -85,7 +85,7 @@ These mappings drive every per-feature port below.
   | `6979cf8`, `01f3879` | Prettier drift | Drop |
 
 - **v2 integration target (the actual scope):**
-  - **Step 1a — `fix/signal-send-retry-with-dedup`** (already in worktree `/tmp/nanoclaw-signal-pr/`, 6 commits on top of `upstream/channels`): introduces a send-retry layer in `sendText` (and `sendAttachments`); uses a single dedupe key that incorporates the attachment fingerprint; propagates failures up to `deliver` so v2's `src/delivery.ts` can record them in `dropped_messages`; exempts our own `Signal RPC timeout:` errors from retry; floors retry delay on stale-connection errors; extends retry budget for attachment sends. Consolidates `d338917` + `0d874c2` + `43f8cfc` + `a0fc96c` + `5776b7f` + `84e4fbb` + `7c7a3e7`. Replay onto `local-v2` once that branch exists.
+  - **Step 1a — Signal send retry + dedupe** (landed on `local-v2`, commits `c75e279..762864d`, 6 commits on top of `upstream/channels`, +427/−26): introduces a send-retry layer in `sendText` (and `sendAttachments`); uses a single dedupe key that incorporates the attachment fingerprint; propagates failures up to `deliver` so v2's `src/delivery.ts` can record them in `dropped_messages`; exempts our own `Signal RPC timeout:` errors from retry; floors retry delay on stale-connection errors; extends retry budget for attachment sends. Consolidates `d338917` + `0d874c2` + `43f8cfc` + `a0fc96c` + `5776b7f` + `84e4fbb` + `7c7a3e7`.
   - **Step 1b — drop.** Local commit `43349e9` was an `attachmentCount`-on-`Signal message sent` log enrichment; in v2 the text and attachment sends produce separate log lines that already carry the count. No port needed.
 - **DB migration:** none.
 - **Dependencies:** none — these are in-file behaviour fixes on the existing v2 adapter. §2.2 (attachments) is the larger work and follows separately.
@@ -208,8 +208,8 @@ Integration order onto `local-v2` (built off `upstream/channels` — which alrea
 
 Estimated total effort: ~0 L + ~5 M + ~7 S ≈ 2–3 focused weeks (was 3–4 before the `upstream/channels` discovery).
 
-**Work-in-progress branches preserved in the local git directory:**
-- `fix/signal-send-retry-with-dedup` (6 commits, +427 / −26, off `upstream/channels`) — work for step #1a; checked out in worktree `/tmp/nanoclaw-signal-pr/`. Merge into `local-v2` when that branch is created.
+**Integration branch:**
+- `local-v2` (off `upstream/channels`) — currently at step 1a's tip (`762864d`). Checked out in worktree `/tmp/nanoclaw-signal-pr/`. Live install on `local` continues running v1; switch over once `local-v2` reaches feature parity.
 
 ---
 
