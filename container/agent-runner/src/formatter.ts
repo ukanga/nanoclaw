@@ -123,9 +123,16 @@ export function formatMessages(messages: MessageInRow[]): string {
   const taskMessages = messages.filter((m) => m.kind === 'task');
   const webhookMessages = messages.filter((m) => m.kind === 'webhook');
   const systemMessages = messages.filter((m) => m.kind === 'system');
+  const deliveryFailures = messages.filter((m) => m.kind === 'delivery-failure');
 
   const parts: string[] = [];
 
+  // Delivery failures go first so the agent reasons about them in the
+  // context of whatever new traffic prompted this turn — and is reminded
+  // not to assume past replies landed before responding to anything new.
+  if (deliveryFailures.length > 0) {
+    parts.push(formatDeliveryFailures(deliveryFailures));
+  }
   if (chatMessages.length > 0) {
     parts.push(formatChatMessages(chatMessages));
   }
@@ -199,6 +206,37 @@ function formatWebhookMessage(msg: MessageInRow): string {
 function formatSystemMessage(msg: MessageInRow): string {
   const content = parseContent(msg.content);
   return `[SYSTEM RESPONSE]\n\nAction: ${content.action || 'unknown'}\nStatus: ${content.status || 'unknown'}\nResult: ${JSON.stringify(content.result || null)}`;
+}
+
+/**
+ * Render `delivery-failure` rows (kind written by the host when an
+ * outbound message hit MAX_DELIVERY_ATTEMPTS) as a v1-compatible
+ * `<delivery-failures>` block. Body text is replayed verbatim — it's the
+ * agent's own prior output, not user input, so XML metacharacters inside
+ * are intentionally not escaped (matches v1 `formatDeliveryFailureBlock`).
+ */
+function formatDeliveryFailures(messages: MessageInRow[]): string {
+  const entries = messages.map(formatSingleDeliveryFailure).join('\n');
+  return `<delivery-failures note="Replies below were emitted by you earlier but did NOT reach the user. Decide whether to re-send (verbatim, summarized, or as a different file) — do not assume the user has seen them.">\n${entries}\n</delivery-failures>`;
+}
+
+function formatSingleDeliveryFailure(msg: MessageInRow): string {
+  const content = parseContent(msg.content);
+  const reason = typeof content.reason === 'string' ? content.reason : 'unknown';
+  const payload = content.payload;
+  const bodyText =
+    typeof payload === 'string'
+      ? payload
+      : payload && typeof payload === 'object' && typeof payload.text === 'string'
+        ? payload.text
+        : '';
+  const files: string[] =
+    payload && typeof payload === 'object' && Array.isArray(payload.files)
+      ? (payload.files as unknown[]).filter((f): f is string => typeof f === 'string')
+      : [];
+  const time = formatLocalTime(msg.timestamp, TIMEZONE);
+  const filesBlock = files.length > 0 ? `\n[files: ${files.map(escapeXml).join(', ')}]` : '';
+  return `<failed-reply at="${escapeXml(time)}" reason="${escapeXml(reason)}">\n${bodyText}${filesBlock}\n</failed-reply>`;
 }
 
 /**

@@ -24,12 +24,7 @@ afterEach(() => {
   closeSessionDb();
 });
 
-function insertMessage(
-  id: string,
-  kind: string,
-  content: object,
-  opts?: { timestamp?: string },
-) {
+function insertMessage(id: string, kind: string, content: object, opts?: { timestamp?: string }) {
   const timestamp = opts?.timestamp ?? new Date().toISOString();
   getInboundDb()
     .prepare(
@@ -136,15 +131,82 @@ describe('XML escaping', () => {
   });
 });
 
+describe('delivery-failure rendering', () => {
+  it('wraps a single failure in a <delivery-failures> block with the v1 instruction note', () => {
+    insertMessage('df1', 'delivery-failure', {
+      originalMessageOutId: 'out-1',
+      reason: 'javax.net.ssl.SSLException: bad_record_mac',
+      payload: { text: 'The file is good.\n[[attach:/workspace/group/outbox/pl.xlsx]]' },
+    });
+    const result = formatMessages(getPendingMessages());
+    expect(result).toContain('<delivery-failures');
+    expect(result).toContain('did NOT reach the user');
+    expect(result).toContain('<failed-reply');
+    expect(result).toContain('reason="javax.net.ssl.SSLException: bad_record_mac"');
+    // Body is replayed verbatim — matches v1 (NOT XML-escaped).
+    expect(result).toContain('[[attach:/workspace/group/outbox/pl.xlsx]]');
+    expect(result).toContain('</failed-reply>');
+    expect(result).toContain('</delivery-failures>');
+  });
+
+  it('escapes XML metacharacters in the reason attribute', () => {
+    insertMessage('df1', 'delivery-failure', {
+      reason: 'boom <crash> & "quote"',
+      payload: { text: 'body' },
+    });
+    const result = formatMessages(getPendingMessages());
+    expect(result).toContain('reason="boom &lt;crash&gt; &amp; &quot;quote&quot;"');
+  });
+
+  it('appends a [files: ...] marker when the failed reply carried files', () => {
+    insertMessage('df1', 'delivery-failure', {
+      reason: 'timeout',
+      payload: { text: 'here you go', files: ['pl-2026.xlsx', 'q3-deck.pdf'] },
+    });
+    const result = formatMessages(getPendingMessages());
+    expect(result).toContain('[files: pl-2026.xlsx, q3-deck.pdf]');
+  });
+
+  it('renders multiple failures in chronological order under one block', () => {
+    insertMessage('df1', 'delivery-failure', {
+      reason: 'first',
+      payload: { text: 'A' },
+    });
+    insertMessage('df2', 'delivery-failure', {
+      reason: 'second',
+      payload: { text: 'B' },
+    });
+    const result = formatMessages(getPendingMessages());
+    const block = result.slice(result.indexOf('<delivery-failures'));
+    expect(block).toContain('reason="first"');
+    expect(block).toContain('reason="second"');
+    // First inserted should appear before the second (chronological order).
+    expect(block.indexOf('reason="first"')).toBeLessThan(block.indexOf('reason="second"'));
+    // One outer wrapper, not one per row.
+    expect((result.match(/<delivery-failures/g) || []).length).toBe(1);
+  });
+
+  it('places the delivery-failures block before chat messages so the agent sees it first', () => {
+    insertMessage('df1', 'delivery-failure', { reason: 'oops', payload: { text: 'stale reply' } });
+    insertMessage('m1', 'chat', { sender: 'Alice', text: 'hello again' });
+    const result = formatMessages(getPendingMessages());
+    expect(result.indexOf('<delivery-failures')).toBeLessThan(result.indexOf('<message'));
+  });
+
+  it('falls back to "unknown" reason when none was recorded', () => {
+    insertMessage('df1', 'delivery-failure', { payload: { text: 'orphan' } });
+    const result = formatMessages(getPendingMessages());
+    expect(result).toContain('reason="unknown"');
+  });
+});
+
 describe('stripInternalTags', () => {
   it('strips single-line internal tags and trims', () => {
     expect(stripInternalTags('hello <internal>secret</internal> world')).toBe('hello  world');
   });
 
   it('strips multi-line internal tags', () => {
-    expect(stripInternalTags('hello <internal>\nsecret\nstuff\n</internal> world')).toBe(
-      'hello  world',
-    );
+    expect(stripInternalTags('hello <internal>\nsecret\nstuff\n</internal> world')).toBe('hello  world');
   });
 
   it('strips multiple internal tag blocks', () => {
@@ -160,8 +222,6 @@ describe('stripInternalTags', () => {
   });
 
   it('preserves content that surrounds internal tags', () => {
-    expect(stripInternalTags('<internal>thinking</internal>The answer is 42')).toBe(
-      'The answer is 42',
-    );
+    expect(stripInternalTags('<internal>thinking</internal>The answer is 42')).toBe('The answer is 42');
   });
 });

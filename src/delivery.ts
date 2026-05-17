@@ -22,6 +22,7 @@ import {
 } from './db/session-db.js';
 import { log } from './log.js';
 import { normalizeOptions } from './channels/ask-question.js';
+import { recordDeliveryFailureForAgent } from './delivery-failures.js';
 import { clearOutbox, openInboundDb, openOutboundDb, readOutboxFiles } from './session-manager.js';
 import { pauseTypingRefreshAfterDelivery, setTypingAdapter } from './modules/typing/index.js';
 import type { OutboundFile } from './channels/adapter.js';
@@ -213,6 +214,18 @@ async function drainSession(session: Session): Promise<void> {
             err,
           });
           markDeliveryFailed(inDb, msg.id);
+          // Surface the permanent failure back to the agent on its next
+          // turn so it can re-send, summarise, or change tack rather than
+          // assume the user saw the reply.
+          try {
+            recordDeliveryFailureForAgent(session, msg, err);
+          } catch (replayErr) {
+            log.error('Failed to record delivery failure for agent replay', {
+              messageId: msg.id,
+              sessionId: session.id,
+              replayErr,
+            });
+          }
           deliveryAttempts.delete(msg.id);
         } else {
           log.warn('Message delivery failed, will retry', {
