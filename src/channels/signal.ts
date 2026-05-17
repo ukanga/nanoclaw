@@ -88,6 +88,100 @@ function spawnSignalDaemon(cliPath: string, account: string, host: string, port:
 
 const RPC_TIMEOUT_MS = 15_000;
 
+// ---------------------------------------------------------------------------
+// Send retry policy
+// ---------------------------------------------------------------------------
+
+// Network-class failure signatures we retry on. signal-cli surfaces the
+// underlying JVM/HTTP error in the JSON-RPC error message; these indicate the
+// message did not reach Signal's servers, so a retry will not duplicate.
+const RETRYABLE_SEND_PATTERNS: RegExp[] = [
+  /UnknownHostException/,
+  /SocketTimeoutException/,
+  /SocketException/i,
+  /bad_record_mac/,
+  /UND_ERR_SOCKET/,
+  /ECONNRESET/,
+  /ETIMEDOUT/,
+  /Broken pipe/,
+  /Connection reset/,
+  /PushNetworkException/,
+];
+
+// Text sends get a short retry budget; attachment sends get a longer one
+// because they survive briefly-broken push connections more often when the
+// delay window is wide enough for signal-cli's ReceiveHelper to reconnect.
+const SEND_BACKOFF_MS = [2_000, 5_000];
+const ATTACHMENT_SEND_BACKOFF_MS = [2_000, 5_000, 15_000, 30_000];
+
+// Subset of retryable errors that indicate signal-cli's push connection to
+// Signal's servers is dead. signal-cli reconnects internally — it logs
+// "Connection closed unexpectedly, reconnecting in 100 ms" — but the actual
+// reconnect takes several seconds under load. Retrying inside that window
+// keeps hitting the same broken socket. Floor the retry delay on these
+// errors so the reconnect can land before our next attempt.
+const STALE_CONNECTION_PATTERNS: RegExp[] = [
+  /bad_record_mac/,
+  /Broken pipe/,
+  /PushNetworkException/,
+];
+const STALE_CONNECTION_MIN_DELAY_MS = 15_000;
+
+function errMessage(err: unknown): string {
+  return err instanceof Error ? err.message : typeof err === 'string' ? err : String(err);
+}
+
+function isRetryableSendError(err: unknown): boolean {
+  // Our own RPC timeout: signal-cli may have already delivered the message
+  // but the response didn't make it back inside RPC_TIMEOUT_MS. Retrying
+  // would duplicate. Surfaced from SignalTcpClient.rpc as
+  // `Error('Signal RPC timeout: <method>')`.
+  const msg = errMessage(err);
+  if (msg.startsWith('Signal RPC timeout:')) return false;
+  return RETRYABLE_SEND_PATTERNS.some((p) => p.test(msg));
+}
+
+function isStaleConnectionError(err: unknown): boolean {
+  const msg = errMessage(err);
+  return STALE_CONNECTION_PATTERNS.some((p) => p.test(msg));
+}
+
+const sleepMs = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
+
+// ---------------------------------------------------------------------------
+// Outbound send dedupe — short-TTL guard against double-sends from upper
+// layers (e.g. delivery-loop retry while a previous attempt's response was
+// in flight). Keyed on (platformId, text, attachmentPathList) so attaching
+// the same caption text to two different files isn't suppressed.
+// ---------------------------------------------------------------------------
+
+const SEND_DEDUP_TTL_MS = 5_000;
+
+class SendDedupe {
+  private entries = new Map<string, number>();
+
+  private keyFor(platformId: string, text: string, attachments: string[]): string {
+    return `${platformId}\x00${text.trim()}\x00${attachments.join('\x00')}`;
+  }
+
+  /** Returns true and records the send. Returns false if a duplicate fired within TTL. */
+  tryRecord(platformId: string, text: string, attachments: string[]): boolean {
+    const key = this.keyFor(platformId, text, attachments);
+    const now = Date.now();
+    const last = this.entries.get(key);
+    if (last !== undefined && now - last < SEND_DEDUP_TTL_MS) return false;
+    this.entries.set(key, now);
+    this.cleanup(now);
+    return true;
+  }
+
+  private cleanup(now: number): void {
+    for (const [k, ts] of this.entries) {
+      if (now - ts > SEND_DEDUP_TTL_MS) this.entries.delete(k);
+    }
+  }
+}
+
 class SignalTcpClient {
   private socket: Socket | null = null;
   private buffer = '';
