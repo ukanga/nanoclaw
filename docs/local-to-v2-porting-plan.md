@@ -13,6 +13,16 @@ A direct merge is impractical because v2.0.0 is an architectural rewrite. This
 plan organises the local work into independent feature ports so each can land
 as its own PR on a fresh branch off `upstream/main`.
 
+> **Update 2026-05-17 (execution-prep):** Most v1 channels and skills already
+> exist on the `upstream/channels` mega-branch — including a full
+> `src/channels/signal.ts` (983 lines), `signal.test.ts` (961 lines), and a
+> `.claude/skills/add-signal/` skill. Similarly `.claude/skills/claw/` exists.
+> §2.1 and §2.5 below have been revised accordingly. **The Signal "port"
+> shrinks from "implement from scratch" to "contribute the local-only
+> hardening commits as small targeted PRs against `upstream/channels` or
+> `upstream/main`."** Re-check the rest of §2 before starting work on each
+> item; expect more such discoveries.
+
 ---
 
 ## 1. v2 surfaces our customizations land on
@@ -41,15 +51,40 @@ These mappings drive every per-feature port below.
 
 ## 2. Local feature inventory
 
-### 2.1 Signal channel — **Large**
+### 2.1 Signal channel — **Small/Medium** (revised — was Large)
 
-- **Files:** `src/channels/signal.ts` (1199 lines), `src/channels/signal.test.ts` (1889 lines), `src/channels/index.ts` (+3), `docs/signal-setup.md`, `.env.example` (+SIGNAL_*)
-- **What it does:** signal-cli JSON-RPC client. Inbound polling + outbound `sendMessage`. Inbound quote/reply context. Native text formatting (`textStyles`). Typing indicators via `updateConfiguration`. Robust retry/dedupe: AbortController-timeout exemption, attachment-aware dedupe keys, attachment retries, stale-connection retry-delay floor, transient send retries before giving up. 0-byte attachment drop. Double-extension fix when signal-cli id already has one.
-- **v2 port target:** new branch `skill/add-signal` on the channels-fork model. Implement `channelImpl` against the v2 channel adapter interface (`src/channels/adapter.ts`) and self-register through `src/channels/registry.ts`. Move docs to the skill's `SKILL.md`. Credentials (`SIGNAL_NUMBER`, signal-cli URL) move into the skill's OneCLI registration.
-- **DB migration:** none from us; channel registration uses the v2 migration `012-channel-registration.ts`.
-- **Dependencies:** must port first — attachments, group-activity script, several `src/index.ts` integration points all assume Signal exists.
-- **Drop:** any in-tree edits to `src/channels/index.ts` (v2 uses registry self-registration).
-- **Test surface:** rewrite the 1889-line test against the v2 adapter contract; keep the regression cases (quote context, textStyles param name & string format, attachment dedupe, AbortController timeout exemption, double-extension, 0-byte drop).
+- **Discovered state:** `upstream/channels` already ships `src/channels/signal.ts` (983 lines), `signal.test.ts` (961 lines), and `.claude/skills/add-signal/` (SKILL.md, REMOVE.md, VERIFY.md). It implements the v2 `ChannelAdapter` contract, self-registers via `registerChannelAdapter('signal', …)` against `./channel-registry.js`, and is functionally on par with local *before* the Signal-hardening series. Live behaviours already present upstream: quote/reply context (correct `replyTo.sender`/`text` shape), `parseSignalStyles` + `textStyle` param name + `${start}:${length}:${style}` string format, typing indicators via `updateConfiguration` on connect, `EchoCache` text-only dedupe, mention resolution to display names, voice transcription via WHISPER_BIN / OPENAI_API_KEY, image attachments emitted as `[Image: <path>]`, groupV2 + legacy groupInfo, multi-platform send, message chunking.
+- **Local deltas to contribute upstream** (per `git log upstream/channels..local -- src/channels/signal.ts`):
+
+  | Local commit | Behaviour | Status upstream |
+  |---|---|---|
+  | `d338917` | Prevent duplicate Signal messages caused by timeout retry | Missing — upstream `sendText` has no retry layer |
+  | `0d874c2` | Retry transient send failures before giving up | Missing |
+  | `43f8cfc` | Propagate send failures instead of logging false success | Missing — upstream `sendText` catches + logs, returns success |
+  | `a0fc96c` | Never retry our own AbortController timeout | Missing (presupposes the retry layer above) |
+  | `5776b7f` | Include attachments in send dedupe key | Missing — upstream `EchoCache` keys on `(platformId, text)` only |
+  | `84e4fbb` | Extend retries for attachment sends | Missing |
+  | `7c7a3e7` | Floor retry delay on stale-connection errors | Missing |
+  | `43349e9` | Include `attachmentCount` in 'Signal message sent' log | Missing (trivial) |
+  | `ba02abd` | Enable typing indicators on connect via `updateConfiguration` | ✅ Present (line 861-868) — drop, no port |
+  | `6519fd7` | Use correct `textStyle` string format | ✅ Present (line 718) — drop |
+  | `bc10c2e` | Use correct `textStyles` parameter name | ✅ Present (line 717-719, param name is `textStyle` — verify singular vs plural matches signal-cli expectations on current version) |
+  | `1bc02f2` + `e5769a1` | `parseSignalStyles` + tests | ✅ `parseSignalStyles` present; tests need to merge |
+  | `53b2799` + `313b963` | Quote/reply context + tests | ✅ Present (line 690-700 + comment) |
+  | `034ac72` | Original Signal channel | ✅ Present (in v2 form) |
+  | `62c6f36` | Avoid double extension when signal-cli id has one | Belongs to §2.2 (attachment inbound naming) |
+  | `1d8a536` | Drop 0-byte attachments from failed signal-cli downloads | Belongs to §2.2 |
+  | `0513c83`, `f82252d`, `f2c1e6a`, `51c46b6`, `ada48be`, `6279306` | Attachment materialization + markers + tests | §2.2 |
+  | `6979cf8`, `01f3879` | Prettier drift | Drop |
+
+- **v2 port targets (the actual PR scope):**
+  - **PR A — `fix/signal-send-retry-with-dedup`:** introduce a send-retry layer in `sendText` (and `sendAttachments`); use a single dedupe key that incorporates the attachment list; propagate failures up to `deliver`; exempt our own AbortController timeouts; floor retry delay on stale-connection errors; extend retry budget for attachment sends. (`d338917` + `0d874c2` + `43f8cfc` + `a0fc96c` + `5776b7f` + `84e4fbb` + `7c7a3e7` consolidated.) Target branch: `upstream/channels` (where signal.ts lives).
+  - **PR B — `log/signal-attachment-count`:** trivial log enrichment (`43349e9`). Target: `upstream/channels`.
+- **DB migration:** none.
+- **Dependencies:** none — these are in-file behaviour fixes on the existing v2 adapter. §2.2 (attachments) is the larger work and follows separately.
+- **Drop:** any standalone "implement Signal from scratch" effort; SKILL.md rewrite (upstream's covers it).
+- **Test surface:** read upstream `signal.test.ts` and add cases for the behaviours added in PR A. Don't wholesale-port the 1889-line local file; it contains attachment-flow tests (§2.2) and tests for behaviours upstream already covers.
+- **Verify-before-PR:** confirm that signal-cli's current `--tcp` JSON-RPC param is `textStyle` (singular, as upstream has it). Local commit `bc10c2e` flipped names; the live behaviour at signal-cli HEAD matters more than what either branch says.
 
 ### 2.2 Attachments end-to-end — **Large**
 
@@ -90,11 +125,11 @@ Three new modules. All assume single-shared-session DB on v1; v2 has split inbou
 - **v2 port target:** v2 has `src/delivery.ts` and `src/db/dropped-messages.ts` (migration `008-dropped-messages.ts`). The local "replay on next turn" likely already exists in v2 in some form via `dropped_messages` + `messages_in.on_wake`. **Verify before porting**: read `src/delivery.ts` and the `008-dropped-messages.ts` migration; if the v2 mechanism covers our case, we just delete the local module. If not, port the replay path on top of `dropped_messages`.
 - **DB migration:** none from us if we adopt the v2 `dropped_messages` table.
 
-### 2.5 `claw` CLI — **Medium**
+### 2.5 `claw` CLI — **Small** (revised — was Medium)
 
-- **Files:** `scripts/claw` (479 lines)
+- **Discovered state:** `.claude/skills/claw/` exists on `upstream/channels` with `SKILL.md` and `scripts/claw` (374 lines). Local has `scripts/claw` (479 lines, ~105 lines ahead) — same Python CLI, almost certainly older + smaller upstream.
 - **What it does:** standalone CLI to run a container agent without a chat channel, using OneCLI credential proxy.
-- **v2 port target:** v2 ships its own `ncl` admin CLI (`src/cli/`, container-side `container/agent-runner/src/cli/ncl.ts`) and a `/claw` operational skill. **Verify** the v2 `/claw` skill (if it exists) — if it covers the same workflow, delete ours. If `/claw` is host-side and `ncl` is admin/DB, they coexist; port `claw` as a thin wrapper over `ncl groups …`.
+- **v2 port target:** diff `upstream/channels:.claude/skills/claw/scripts/claw` against `local:scripts/claw`; contribute the local-only deltas as a PR against `upstream/channels`. Drop the from-scratch port plan.
 - **DB migration:** none.
 
 ### 2.6 Helper scripts — **Small**
@@ -147,34 +182,39 @@ All other features (Signal, sessions, delivery, scripts, container skills, agent
 
 Each row is an independent branch off `upstream/main`, mergeable on its own. Order maximises parallel work and unblocks dependents early.
 
-| # | Branch | Scope | Size |
-|---|---|---|---|
-| 1 | `skill/add-signal` | 2.1 Signal channel as a v2 channel skill | L |
-| 2 | `feat/attachment-metadata` | 2.2 migration `016-` + storage plumbing only (no markers yet) | M |
-| 3 | `feat/attachment-markers` | 2.2 marker emission + parsing + bundling in send | M |
-| 4 | `feat/attachment-ttl-sweep` | 2.2 inbox/outbox TTL sweeper | S |
-| 5 | `feat/session-rotation` | 2.3 rotation + size helpers, adapted to two-DB split | M |
-| 6 | `feat/session-commands` | 2.3 admin commands behind v2 user-roles | M |
-| 7 | `feat/delivery-replay` | 2.4 — **only if** v2 `dropped_messages` doesn't already cover it | S |
-| 8 | `chore/vendor-container-skills` | 2.7 copy 10 container skills + sanity pass | S |
-| 9 | `feat/claw-cli` | 2.5 — **only if** v2 `/claw` skill doesn't cover it | M |
-| 10 | `chore/helper-scripts` | 2.6 rewrite scripts on `ncl` | S |
-| 11 | `fix/agent-runner-reliability` | 2.8 surviving items | S |
-| 12 | `chore/docs-debug-checklist` | 2.9 doc deltas | S |
+| # | Branch | Scope | Size | Target |
+|---|---|---|---|---|
+| 1a | `fix/signal-send-retry-with-dedup` | 2.1 retry layer + propagate failures + attachment-aware dedupe + AbortController exempt + stale-conn floor + attachment retry budget | S/M | `upstream/channels` |
+| 1b | `log/signal-attachment-count` | 2.1 attachmentCount in send log | XS | `upstream/channels` |
+| 2 | `feat/attachment-metadata` | 2.2 migration `016-` + storage plumbing only (no markers yet) | M | `upstream/main` |
+| 3 | `feat/attachment-markers` | 2.2 marker emission + parsing + bundling in send | M | `upstream/main` |
+| 4 | `feat/attachment-ttl-sweep` | 2.2 inbox/outbox TTL sweeper | S | `upstream/main` |
+| 5 | `feat/session-rotation` | 2.3 rotation + size helpers, adapted to two-DB split | M | `upstream/main` |
+| 6 | `feat/session-commands` | 2.3 admin commands behind v2 user-roles | M | `upstream/main` |
+| 7 | `feat/delivery-replay` | 2.4 — **only if** v2 `dropped_messages` doesn't already cover it | S | `upstream/main` |
+| 8 | `chore/vendor-container-skills` | 2.7 copy 10 container skills + sanity pass | S | `upstream/main` |
+| 9 | `feat/claw-cli-deltas` | 2.5 diff `local:scripts/claw` against `upstream/channels:.claude/skills/claw/scripts/claw`, contribute the ~105-line delta | S | `upstream/channels` |
+| 10 | `chore/helper-scripts` | 2.6 rewrite scripts on `ncl` | S | `upstream/main` |
+| 11 | `fix/agent-runner-reliability` | 2.8 surviving items | S | `upstream/main` |
+| 12 | `chore/docs-debug-checklist` | 2.9 doc deltas | S | `upstream/main` |
 
-Estimated total effort: ~3 L + ~5 M + ~5 S ≈ 3–4 focused weeks.
+Estimated total effort: ~0 L + ~5 M + ~7 S ≈ 2–3 focused weeks (was 3–4 before the `upstream/channels` discovery).
 
 ---
 
 ## 5. Verify-before-porting checklist
 
-Before writing code for each numbered branch above, confirm the v2 surface:
+Before writing code for each numbered branch above, confirm the v2 surface.
 
-- [ ] **2.1 Signal** — read `src/channels/adapter.ts`, `src/channels/registry.ts`, and one in-tree channel skill (e.g. `skill/add-telegram`) to learn the adapter contract.
+> **General rule from the 2026-05-17 discovery:** before scoping any branch
+> below, also `git ls-tree -r upstream/channels` for whatever the local file is.
+> Many v1 channels and skills already live there in v2 form.
+
+- [x] **2.1 Signal** — DONE 2026-05-17. v2 adapter lives at `upstream/channels:src/channels/signal.ts` (registered via `channel-registry.ts`, not `registry.ts`). Skill at `upstream/channels:.claude/skills/add-signal/`. Local deltas mapped in §2.1.
 - [ ] **2.2 Attachments** — read v2 `messages_in` / `messages_out` schema in `container/agent-runner/src/db/messages-in.ts` and `messages-out.ts`. Read `formatter.ts` + `destinations.ts` to see where to slot the marker code.
 - [ ] **2.3 Session rotation** — read `src/db/session-db.ts`, `src/db/sessions.ts`, and `src/session-manager.ts` to learn how sessions are sized in v2.
 - [ ] **2.4 Delivery replay** — read `src/delivery.ts` and `src/db/migrations/008-dropped-messages.ts`. If `dropped_messages.on_wake` already replays into the agent's next turn, **drop the local module**.
-- [ ] **2.5 `claw`** — `ls .claude/skills/claw/` on upstream/main. If it exists, read its SKILL.md before deciding whether to port the local script.
+- [x] **2.5 `claw`** — DONE 2026-05-17. Skill exists at `upstream/channels:.claude/skills/claw/`. Diff approach in §2.5.
 - [ ] **2.8 Reliability** — read `container/agent-runner/src/providers/claude.ts` and `circuit-breaker.ts` for the v2 retry surface.
 
 ---
