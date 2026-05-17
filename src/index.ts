@@ -13,6 +13,7 @@ import { runMigrations } from './db/migrations/index.js';
 import { ensureContainerRuntimeRunning, cleanupOrphans } from './container-runtime.js';
 import { startActiveDeliveryPoll, startSweepDeliveryPoll, setDeliveryAdapter, stopDeliveryPolls } from './delivery.js';
 import { startHostSweep, stopHostSweep } from './host-sweep.js';
+import { startAttachmentSweep, stopAttachmentSweep } from './attachment-sweep.js';
 import { routeInbound } from './router.js';
 import { log } from './log.js';
 
@@ -159,6 +160,9 @@ async function main(): Promise<void> {
   startHostSweep();
   log.info('Host sweep started');
 
+  // 7. Start attachment TTL sweep
+  startAttachmentSweep();
+
   log.info('NanoClaw running');
 }
 
@@ -174,6 +178,7 @@ async function shutdown(signal: string): Promise<void> {
   }
   stopDeliveryPolls();
   stopHostSweep();
+  stopAttachmentSweep();
   await teardownChannelAdapters();
   process.exit(0);
 }
