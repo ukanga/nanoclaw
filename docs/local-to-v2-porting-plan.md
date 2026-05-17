@@ -272,8 +272,10 @@ These local commits should **not** be carried forward:
 
 ## 7. Cutover sequence (live install → `local-v2`)
 
-`local-v2` is at v1 feature parity as of step 13 (`929597b`, 2026-05-17). The
-live install on `local` is still v1.
+`local-v2` is at v1 feature parity as of step 13 (`929597b`, 2026-05-17),
+plus cutover bug fixes in `b1ef451` (Dockerfile pnpm@11 + Signal barrel).
+Cutover successfully executed on 2026-05-17 (see commit history on `local`
+for the supporting plan revisions).
 
 > **Reality check before you start.** `v2:CLAUDE.md:9` instructs Claude to
 > tell users to run `bash migrate-v2.sh`, but that script **does not exist**
@@ -327,25 +329,30 @@ pnpm install
 pnpm run build
 ```
 
-The 6 pre-existing tsc errors in `src/channels/{deltachat,slack,telegram,signal.test}.ts` (confirmed unchanged through step 12) don't block runtime — your install only loads the Signal channel. If `tsc` won't complete, run with `--skipLibCheck` or accept the partial `dist/`.
+The 6 pre-existing tsc errors in `src/channels/{deltachat,slack,telegram,signal.test}.ts` (confirmed unchanged through step 12) don't block runtime — your install only loads the Signal channel. `tsc` exits non-zero but `dist/` is fully populated by the same run (TypeScript's `noEmitOnError: false` default). Verify with `ls dist/index.js dist/channels/signal.js dist/router.js`; if those exist, move on.
 
 ### 7.5 Run v2 setup
 
-```bash
-pnpm run setup
-```
-
-Walks timezone, install-slug confirmation, channels (pick Signal), OneCLI wiring (already configured — should detect), mount-allowlist, and **installs the new systemd unit `nanoclaw-v2-7037baf1.service`** (replaces v1's `nanoclaw.service`). Disable the v1 unit afterwards to keep it from racing on next login:
+**⚠ `pnpm run setup` is not a wizard** — it's a per-step CLI driver requiring `--step <name>` (see `setup/index.ts`). The right entry point for a clean install is the `/setup` skill (interactive Claude Code skill); for a partial cutover you can call individual steps. The non-interactive ones, in order:
 
 ```bash
-systemctl --user disable nanoclaw.service
+pnpm exec tsx setup/index.ts --step environment
+pnpm exec tsx setup/index.ts --step mounts        # idempotent if ~/.config/nanoclaw/mount-allowlist.json already exists
+pnpm exec tsx setup/index.ts --step timezone
+pnpm exec tsx setup/index.ts --step service       # ⚠ see gotcha below
 ```
+
+> **Gotcha — `setup/index.ts --step service` runs `pnpm run build` internally** and exits with `STATUS: failed ERROR: build_failed` when tsc returns non-zero (the 6 inherited errors in §7.4). Workaround for this cutover: write the systemd unit manually using the same template from `setup/service.ts:275-292`. For this install the unit path is `~/.config/systemd/user/nanoclaw-v2-7037baf1.service`, ExecStart `/usr/bin/node /home/ukanga/code/nanoclaw/dist/index.js`, then `systemctl --user daemon-reload && systemctl --user enable nanoclaw-v2-7037baf1.service`. Disable the v1 unit: `systemctl --user disable nanoclaw.service`.
+
+> **Gotcha — `setup/index.ts --step onecli` will try to reinstall OneCLI.** It runs `docker compose down && docker compose up` on the OneCLI stack which restarts the postgres container (~18s outage on the OneCLI vault). The existing OneCLI install survives, but skip this step if your gateway is already reachable at the URL in `.env`.
 
 ### 7.6 Re-add Signal channel
 
 ```bash
 bash setup/add-signal.sh
 ```
+
+> **Gotcha — `setup/add-signal.sh` overwrites `src/channels/signal.ts` and `src/channels/signal.test.ts` with the `upstream/channels` copies**, discarding any local changes (specifically: step 2's inbound-attachment work). If that's bad, restore them after: `git checkout src/channels/signal.ts src/channels/signal.test.ts`. The only useful side-effect of `add-signal.sh` is appending `import './signal.js';` to `src/channels/index.ts` — you can do that one-line edit directly and skip the script entirely. After either path, rebuild (`pnpm run build`) and restart the service.
 
 Your dedicated Signal number (`ASSISTANT_HAS_OWN_NUMBER=true`) is picked up from `.env`. Daemon credentials live outside the NanoClaw checkout, so no re-registration of the Signal account.
 
@@ -404,9 +411,20 @@ Re-add by talking to the agent — it can call the v2 scheduling MCP tool to rec
 ```bash
 systemctl --user start nanoclaw-v2-7037baf1.service
 journalctl --user -u nanoclaw-v2-7037baf1.service -f --since "1 min ago"
-claw "hello"          # exercises cli/local wiring
-# also send a Signal message — should still work
 ```
+
+> **Gotcha — the container image must be rebuilt before claw works.** v2 uses a per-install image tag (`nanoclaw-agent-v2-7037baf1:latest`) computed from the project root sha1. v1's `nanoclaw-agent:latest` won't match. Build with `bash container/build.sh`. The Dockerfile uses BuildKit `--mount=type=cache` directives, which require the `docker-buildx-plugin` package (`sudo apt install docker-buildx-plugin` on Ubuntu/Pop_OS!).
+>
+> Two further bugs the cutover ran into and fixed on `local-v2` (`b1ef451`):
+> - **pnpm@11 global bin moved from `/pnpm/` to `/pnpm/bin/`.** The agent-runner hard-codes `pathToClaudeCodeExecutable: '/pnpm/claude'`. Force the old layout with `pnpm config set global-bin-dir "$PNPM_HOME"` in the Dockerfile.
+> - **`only-built-dependencies` isn't honoured for global installs in pnpm@11.** The `@anthropic-ai/claude-code` postinstall (which swaps the ~444-byte placeholder for the 237 MB native ELF) never runs. Manually invoke `install.cjs` after the global install. Both fixes are in `b1ef451`.
+
+```bash
+claw "hello"          # exercises cli/local wiring
+# also send a Signal message with "Nini" mention — should still work
+```
+
+> **Gotcha — long-lived containers don't pick up image rebuilds.** v2 keeps the agent container alive between messages (idle-timeout 30 min). After a `bash container/build.sh`, kill the running container so the next message spawns a fresh one: `docker ps --filter "name=nanoclaw-v2-" -q | xargs -r docker rm -f`.
 
 ### 7.12 Update any rotation cron
 
