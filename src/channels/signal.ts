@@ -620,6 +620,7 @@ export function createSignalAdapter(config: {
   let tcp: SignalTcpClient | null = null;
   let connected = false;
   const echoCache = new EchoCache();
+  const sendDedupe = new SendDedupe();
   let setup: ChannelSetup | null = null;
 
   // -- inbound handling --
@@ -1061,6 +1062,22 @@ export function createSignalAdapter(config: {
       }
 
       const files = message.files ?? [];
+
+      // Host-side outbound dedupe. Guards against the delivery layer
+      // re-invoking deliver after our own RPC timeout fired but signal-cli
+      // had already pushed the message — see isRetryableSendError's note on
+      // 'Signal RPC timeout:'. Keys include files (fingerprint by name+size)
+      // so the same caption text attached to two different files does not
+      // collapse.
+      const filesFingerprint = files.map((f) => `${f.filename}:${f.data.byteLength}`);
+      if (!sendDedupe.tryRecord(platformId, text ?? '', filesFingerprint)) {
+        log.debug('Signal: skipping duplicate outbound delivery', {
+          platformId,
+          textLength: text?.length ?? 0,
+          fileCount: files.length,
+        });
+        return undefined;
+      }
 
       // Send accompanying text first so it lands above the attachment(s) in
       // the recipient's chat. Both branches no-op cleanly if their input is
