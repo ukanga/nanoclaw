@@ -901,6 +901,224 @@ describe('SignalAdapter', () => {
     });
   });
 
+  // --- Send retry + outbound dedupe ---
+
+  describe('send retry + outbound dedupe', () => {
+    /**
+     * Override fakeSocket.write so the Nth `send` call sees a custom outcome.
+     * outcomes[i] is the (zero-indexed) attempt response: either { error: msg }
+     * to make signal-cli reply with a JSON-RPC error, or { result: any } to
+     * succeed. Subsequent attempts beyond outcomes.length default to success.
+     */
+    function programSendOutcomes(outcomes: Array<{ error: string } | { result: unknown }>): { sendCount: () => number } {
+      let sendCount = 0;
+      tcpRef.fakeSocket.write.mockImplementation((data: string) => {
+        try {
+          const req = JSON.parse(data.trim());
+          // Emit synchronously so the rpc Promise settles before the next
+          // fake-timer advance can fire RPC_TIMEOUT_MS. setImmediate-real
+          // does not interleave with vi.advanceTimersByTimeAsync.
+          if (req.method === 'send') {
+            const outcome = outcomes[sendCount] ?? { result: { ok: true } };
+            sendCount++;
+            const payload =
+              'error' in outcome
+                ? { jsonrpc: '2.0', id: req.id, error: { message: outcome.error } }
+                : { jsonrpc: '2.0', id: req.id, result: outcome.result };
+            tcpRef.fakeSocket.emit('data', Buffer.from(JSON.stringify(payload) + '\n'));
+            return;
+          }
+          const fallback = JSON.stringify({ jsonrpc: '2.0', id: req.id, result: { ok: true } }) + '\n';
+          tcpRef.fakeSocket.emit('data', Buffer.from(fallback));
+        } catch {
+          /* ignore */
+        }
+      });
+      return { sendCount: () => sendCount };
+    }
+
+    it('retries on transient send error and succeeds on the retry', async () => {
+      vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+      const adapter = createAdapter();
+      await adapter.setup(createMockSetup());
+      tcpRef.fakeSocket.write.mockClear();
+
+      const tracker = programSendOutcomes([{ error: 'UND_ERR_SOCKET' }, { result: { ok: true } }]);
+
+      const deliverPromise = adapter.deliver('+15555550123', null, {
+        kind: 'text',
+        content: { text: 'hi' },
+      });
+      // Advance past SEND_BACKOFF_MS[0] = 2000ms
+      await vi.advanceTimersByTimeAsync(2000);
+      await deliverPromise;
+
+      expect(tracker.sendCount()).toBe(2);
+
+      vi.useRealTimers();
+      await adapter.teardown();
+    });
+
+    it('does NOT retry our own RPC timeout — signal-cli may have delivered', async () => {
+      vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+      const adapter = createAdapter();
+      await adapter.setup(createMockSetup());
+      tcpRef.fakeSocket.write.mockClear();
+
+      const tracker = programSendOutcomes([{ error: 'Signal RPC timeout: send' }, { result: { ok: true } }]);
+
+      await expect(
+        adapter.deliver('+15555550123', null, { kind: 'text', content: { text: 'hi' } }),
+      ).rejects.toThrow(/Signal RPC timeout: send/);
+
+      expect(tracker.sendCount()).toBe(1);
+
+      vi.useRealTimers();
+      await adapter.teardown();
+    });
+
+    it('exhausts retries on persistent failure and propagates to caller', async () => {
+      vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+      const adapter = createAdapter();
+      await adapter.setup(createMockSetup());
+      tcpRef.fakeSocket.write.mockClear();
+
+      // 3 errors = initial attempt + 2 retries from SEND_BACKOFF_MS, all fail.
+      const tracker = programSendOutcomes([
+        { error: 'UND_ERR_SOCKET' },
+        { error: 'UND_ERR_SOCKET' },
+        { error: 'UND_ERR_SOCKET' },
+      ]);
+
+      const deliverPromise = adapter.deliver('+15555550123', null, {
+        kind: 'text',
+        content: { text: 'hi' },
+      });
+      // Suppress the unhandled-rejection visibility; we assert via await below.
+      deliverPromise.catch(() => {});
+      // 2s for attempt 0 → 1; 5s for attempt 1 → 2
+      await vi.advanceTimersByTimeAsync(2000);
+      await vi.advanceTimersByTimeAsync(5000);
+      await expect(deliverPromise).rejects.toThrow(/UND_ERR_SOCKET/);
+
+      expect(tracker.sendCount()).toBe(3);
+
+      vi.useRealTimers();
+      await adapter.teardown();
+    });
+
+    it('attachment send uses the longer ATTACHMENT_SEND_BACKOFF_MS budget', async () => {
+      vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+      const adapter = createAdapter();
+      await adapter.setup(createMockSetup());
+      tcpRef.fakeSocket.write.mockClear();
+
+      // 5 errors = initial attempt + 4 retries from ATTACHMENT_SEND_BACKOFF_MS.
+      const tracker = programSendOutcomes([
+        { error: 'PushNetworkException' },
+        { error: 'PushNetworkException' },
+        { error: 'PushNetworkException' },
+        { error: 'PushNetworkException' },
+        { error: 'PushNetworkException' },
+      ]);
+
+      const deliverPromise = adapter.deliver('+15555550123', null, {
+        kind: 'file',
+        content: {},
+        files: [{ filename: 'r.md', data: Buffer.from('x') }],
+      });
+      deliverPromise.catch(() => {});
+      // Stale-connection floor lifts each delay to >= 15s. Advance past all
+      // four backoff slots accordingly.
+      for (let i = 0; i < 4; i++) await vi.advanceTimersByTimeAsync(60_000);
+      await expect(deliverPromise).rejects.toThrow(/PushNetworkException/);
+
+      expect(tracker.sendCount()).toBe(5);
+
+      vi.useRealTimers();
+      await adapter.teardown();
+    });
+
+    it('floors retry delay to STALE_CONNECTION_MIN_DELAY_MS on stale-connection errors', async () => {
+      vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+      const { log } = (await import('../log.js')) as { log: { warn: ReturnType<typeof vi.fn> } };
+      const adapter = createAdapter();
+      await adapter.setup(createMockSetup());
+      tcpRef.fakeSocket.write.mockClear();
+      (log.warn as ReturnType<typeof vi.fn>).mockClear();
+
+      programSendOutcomes([{ error: 'bad_record_mac' }, { result: { ok: true } }]);
+
+      const deliverPromise = adapter.deliver('+15555550123', null, {
+        kind: 'text',
+        content: { text: 'hi' },
+      });
+      // Stale-floor lifts the first delay from 2000 to 15000ms.
+      await vi.advanceTimersByTimeAsync(15_000);
+      await deliverPromise;
+
+      const retryLog = (log.warn as ReturnType<typeof vi.fn>).mock.calls.find((c) =>
+        String(c[0]).includes('transient send error'),
+      );
+      expect(retryLog).toBeDefined();
+      const [, fields] = retryLog as [string, Record<string, unknown>];
+      expect(fields.stale).toBe(true);
+      expect(fields.delayMs).toBe(15_000);
+
+      vi.useRealTimers();
+      await adapter.teardown();
+    });
+
+    it('dedupes a duplicate deliver call within TTL', async () => {
+      const adapter = createAdapter();
+      await adapter.setup(createMockSetup());
+      tcpRef.fakeSocket.write.mockClear();
+
+      await adapter.deliver('+15555550123', null, { kind: 'text', content: { text: 'same body' } });
+      await adapter.deliver('+15555550123', null, { kind: 'text', content: { text: 'same body' } });
+
+      expect(getRpcCallsForMethod('send')).toHaveLength(1);
+
+      await adapter.teardown();
+    });
+
+    it('does not dedupe different text bodies', async () => {
+      const adapter = createAdapter();
+      await adapter.setup(createMockSetup());
+      tcpRef.fakeSocket.write.mockClear();
+
+      await adapter.deliver('+15555550123', null, { kind: 'text', content: { text: 'hi' } });
+      await adapter.deliver('+15555550123', null, { kind: 'text', content: { text: 'hello' } });
+
+      expect(getRpcCallsForMethod('send')).toHaveLength(2);
+
+      await adapter.teardown();
+    });
+
+    it('does not dedupe same caption with different attached files', async () => {
+      const adapter = createAdapter();
+      await adapter.setup(createMockSetup());
+      tcpRef.fakeSocket.write.mockClear();
+
+      await adapter.deliver('+15555550123', null, {
+        kind: 'file',
+        content: { text: 'caption' },
+        files: [{ filename: 'a.txt', data: Buffer.from('AAA') }],
+      });
+      await adapter.deliver('+15555550123', null, {
+        kind: 'file',
+        content: { text: 'caption' },
+        files: [{ filename: 'b.txt', data: Buffer.from('BBBB') }],
+      });
+
+      // Each deliver: 1 send for caption text + 1 send for attachment = 2.
+      // Two deliveries should produce 4 sends total when dedupe is fingerprint-aware.
+      expect(getRpcCallsForMethod('send')).toHaveLength(4);
+
+      await adapter.teardown();
+    });
+  });
+
   // --- Connection drop ---
 
   describe('connection drop', () => {
