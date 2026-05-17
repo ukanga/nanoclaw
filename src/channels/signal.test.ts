@@ -576,9 +576,7 @@ describe('SignalAdapter', () => {
       );
       expect((sendCalls[0].params as Record<string, unknown>).attachments).toBeUndefined();
       // Second call: attachment, no message
-      expect(sendCalls[1].params).toEqual(
-        expect.objectContaining({ recipient: ['+15555550123'] }),
-      );
+      expect(sendCalls[1].params).toEqual(expect.objectContaining({ recipient: ['+15555550123'] }));
       const attachments = (sendCalls[1].params as Record<string, unknown>).attachments as string[];
       expect(attachments).toHaveLength(1);
 
@@ -887,7 +885,9 @@ describe('SignalAdapter', () => {
      * to make signal-cli reply with a JSON-RPC error, or { result: any } to
      * succeed. Subsequent attempts beyond outcomes.length default to success.
      */
-    function programSendOutcomes(outcomes: Array<{ error: string } | { result: unknown }>): { sendCount: () => number } {
+    function programSendOutcomes(outcomes: Array<{ error: string } | { result: unknown }>): {
+      sendCount: () => number;
+    } {
       let sendCount = 0;
       tcpRef.fakeSocket.write.mockImplementation((data: string) => {
         try {
@@ -944,9 +944,9 @@ describe('SignalAdapter', () => {
 
       const tracker = programSendOutcomes([{ error: 'Signal RPC timeout: send' }, { result: { ok: true } }]);
 
-      await expect(
-        adapter.deliver('+15555550123', null, { kind: 'text', content: { text: 'hi' } }),
-      ).rejects.toThrow(/Signal RPC timeout: send/);
+      await expect(adapter.deliver('+15555550123', null, { kind: 'text', content: { text: 'hi' } })).rejects.toThrow(
+        /Signal RPC timeout: send/,
+      );
 
       expect(tracker.sendCount()).toBe(1);
 

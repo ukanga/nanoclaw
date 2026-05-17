@@ -852,11 +852,16 @@ export function createSignalAdapter(config: {
       const cached = findCachedAttachment(cacheDir, att.id);
       if (!cached) {
         const placeholder = signalCachePlaceholderExists(cacheDir, att.id);
-        log.warn(placeholder ? 'Signal: attachment download failed (0-byte placeholder), skipping' : 'Signal: attachment cache file missing, skipping', {
-          id: att.id,
-          cacheDir,
-          placeholder,
-        });
+        log.warn(
+          placeholder
+            ? 'Signal: attachment download failed (0-byte placeholder), skipping'
+            : 'Signal: attachment cache file missing, skipping',
+          {
+            id: att.id,
+            cacheDir,
+            placeholder,
+          },
+        );
         continue;
       }
       let bytes: Buffer;
@@ -876,7 +881,13 @@ export function createSignalAdapter(config: {
       const name = sanitizeAttachmentName(att.filename, att.id, att.contentType);
       attachments.push({
         name,
-        type: mimeType.startsWith('image/') ? 'image' : mimeType.startsWith('audio/') ? 'audio' : mimeType.startsWith('video/') ? 'video' : 'file',
+        type: mimeType.startsWith('image/')
+          ? 'image'
+          : mimeType.startsWith('audio/')
+            ? 'audio'
+            : mimeType.startsWith('video/')
+              ? 'video'
+              : 'file',
         mimeType,
         size: bytes.length,
         data: bytes.toString('base64'),
