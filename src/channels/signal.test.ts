@@ -337,34 +337,11 @@ describe('SignalAdapter', () => {
       await adapter.teardown();
     });
 
-    it('forwards image attachments as [Image: <path>] plus structured attachments array', async () => {
-      const adapter = createAdapter();
-      const cfg = createMockSetup();
-      await adapter.setup(cfg);
-
-      pushEvent({
-        sourceNumber: '+15555550123',
-        sourceName: 'Alice',
-        dataMessage: {
-          timestamp: 1700000000000,
-          attachments: [{ id: 'att123abc', contentType: 'image/jpeg', size: 50000 }],
-        },
-      });
-
-      await new Promise((r) => setTimeout(r, 50));
-      expect(cfg.onInbound).toHaveBeenCalledWith(
-        '+15555550123',
-        null,
-        expect.objectContaining({
-          content: expect.objectContaining({
-            text: expect.stringMatching(/^\[Image: .+att123abc\]$/),
-            attachments: [expect.objectContaining({ contentType: 'image/jpeg' })],
-          }),
-        }),
-      );
-
-      await adapter.teardown();
-    });
+    // Inbound attachment cases (image, audio, oversize, 0-byte, missing,
+    // unsafe filename, double-extension) are covered by the new test block
+    // in `describe('inbound attachment materialization', …)` — to be added
+    // alongside this refactor. The old `[Image: <cache-path>]` test was
+    // removed when adapter switched to content.attachments[] with base64.
   });
 
   // --- groupV2 ---

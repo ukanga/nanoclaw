@@ -79,7 +79,11 @@ function signalCachePlaceholderExists(cacheDir: string, id: string): boolean {
  * Signal-supplied name is empty or fully sanitises away. The `idHasExt`
  * branch avoids double-extensioning files like `wx58.png` whose signal-cli
  * id already carries the right extension. */
-function sanitizeAttachmentName(filename: string | undefined, fallbackId: string, contentType: string | undefined): string {
+function sanitizeAttachmentName(
+  filename: string | undefined,
+  fallbackId: string,
+  contentType: string | undefined,
+): string {
   const base = (filename ?? '').trim();
   // Strip directory components and replace unsafe chars with underscores.
   // path.basename here is defensive in case Signal ever leaks a relative
@@ -756,10 +760,10 @@ export function createSignalAdapter(config: {
     const text = rawText ? resolveMentions(rawText, dataMessage.mentions) : '';
 
     const audioAttachment = dataMessage.attachments?.find((a) => a.contentType?.startsWith('audio/') && a.id);
-    const imageAttachments = dataMessage.attachments?.filter((a) => a.contentType?.startsWith('image/') && a.id) ?? [];
     const hasVoice = !text && !!audioAttachment;
+    const hasAnyAttachment = (dataMessage.attachments?.length ?? 0) > 0;
 
-    if (!text && !hasVoice && imageAttachments.length === 0) return;
+    if (!text && !hasVoice && !hasAnyAttachment) return;
 
     const sender = (envelope.sourceNumber ?? envelope.sourceUuid ?? envelope.source ?? '').trim();
     if (!sender) return;
@@ -786,19 +790,22 @@ export function createSignalAdapter(config: {
     setup.onMetadata(platformId, chatName, isGroup);
 
     let content = text;
+    const cacheDir = join(config.signalDataDir, 'attachments');
 
     // Voice attachment — try transcription if WHISPER_BIN or OPENAI_API_KEY
-    // is configured; otherwise fall back to the original placeholder so
-    // operators who don't want transcription get the same UX as before.
+    // is configured; otherwise fall back to the placeholder. Transcription
+    // reads directly from signal-cli's cache; the file is also offered to
+    // the agent through the structured attachments array below so the agent
+    // can re-listen if needed.
     if (hasVoice && audioAttachment?.id) {
-      const attachmentPath = join(config.signalDataDir, 'attachments', audioAttachment.id);
-      if (existsSync(attachmentPath)) {
+      const cachedAudio = findCachedAttachment(cacheDir, audioAttachment.id);
+      if (cachedAudio) {
         log.info('Signal: voice attachment received', {
           platformId,
           attachmentId: audioAttachment.id,
-          path: attachmentPath,
+          path: cachedAudio,
         });
-        const transcript = await transcribeAudioOptional(attachmentPath);
+        const transcript = await transcribeAudioOptional(cachedAudio);
         if (transcript) {
           content = `[Voice: ${transcript}]`;
           log.info('Signal: voice transcribed', { platformId, length: transcript.length });
@@ -806,24 +813,74 @@ export function createSignalAdapter(config: {
           content = '[Voice Message]';
         }
       } else {
-        log.warn('Signal: voice attachment file not found', {
+        const placeholder = signalCachePlaceholderExists(cacheDir, audioAttachment.id);
+        log.warn('Signal: voice attachment cache file unavailable', {
           id: audioAttachment.id,
-          path: attachmentPath,
+          cacheDir,
+          placeholder,
         });
-        content = '[Voice Message - file not found]';
+        content = placeholder ? '[Voice Message - download failed]' : '[Voice Message - file not found]';
       }
     }
 
-    // Image attachments — emit `[Image: <path>]` lines so the agent's Read
-    // tool can pick them up, and surface the structured `attachments` array
-    // for consumers that prefer that shape. Without this, vision-capable
-    // models never see images sent over Signal.
-    const attachmentRefs: Array<{ path: string; contentType: string }> = [];
-    for (const img of imageAttachments) {
-      const imagePath = join(config.signalDataDir, 'attachments', img.id!);
-      const imageLine = `[Image: ${imagePath}]`;
-      content = content ? `${content}\n${imageLine}` : imageLine;
-      attachmentRefs.push({ path: imagePath, contentType: img.contentType || 'image/jpeg' });
+    // Build content.attachments[] with base64 payloads. The host's
+    // session-manager.extractAttachmentFiles writes each entry's `data` into
+    // `<sessionDir>/inbox/<messageId>/<name>` and replaces it with
+    // `localPath`, so the agent ultimately reads files from per-session
+    // storage instead of the shared signal-cli cache (which is GC'd and
+    // cross-group visible). Voice attachments are included so the agent can
+    // re-listen even after transcription.
+    const attachments: Array<{
+      name: string;
+      type: string;
+      mimeType: string;
+      size: number;
+      data: string;
+    }> = [];
+
+    for (const att of dataMessage.attachments ?? []) {
+      if (!att.id) continue;
+      const declaredSize = att.size ?? 0;
+      if (declaredSize > MAX_ATTACHMENT_BYTES) {
+        log.warn('Signal: skipping oversize attachment', {
+          id: att.id,
+          size: declaredSize,
+          max: MAX_ATTACHMENT_BYTES,
+        });
+        continue;
+      }
+      const cached = findCachedAttachment(cacheDir, att.id);
+      if (!cached) {
+        const placeholder = signalCachePlaceholderExists(cacheDir, att.id);
+        log.warn(placeholder ? 'Signal: attachment download failed (0-byte placeholder), skipping' : 'Signal: attachment cache file missing, skipping', {
+          id: att.id,
+          cacheDir,
+          placeholder,
+        });
+        continue;
+      }
+      let bytes: Buffer;
+      try {
+        bytes = readFileSync(cached);
+      } catch (err) {
+        log.warn('Signal: failed to read cached attachment, skipping', { id: att.id, cached, err });
+        continue;
+      }
+      if (bytes.length === 0) {
+        // Race: findCachedAttachment saw bytes, but the file was rotated
+        // between the stat and the read. Treat as placeholder.
+        log.warn('Signal: attachment was 0 bytes at read time, skipping', { id: att.id, cached });
+        continue;
+      }
+      const mimeType = att.contentType ?? 'application/octet-stream';
+      const name = sanitizeAttachmentName(att.filename, att.id, att.contentType);
+      attachments.push({
+        name,
+        type: mimeType.startsWith('image/') ? 'image' : mimeType.startsWith('audio/') ? 'audio' : mimeType.startsWith('video/') ? 'video' : 'file',
+        mimeType,
+        size: bytes.length,
+        data: bytes.toString('base64'),
+      });
     }
 
     const msg: InboundMessage = {
@@ -834,7 +891,7 @@ export function createSignalAdapter(config: {
         sender,
         senderId: `signal:${sender}`,
         senderName,
-        ...(attachmentRefs.length > 0 ? { attachments: attachmentRefs } : {}),
+        ...(attachments.length > 0 ? { attachments } : {}),
         ...(dataMessage.quote ? quoteToContent(dataMessage.quote) : {}),
       },
       timestamp,
