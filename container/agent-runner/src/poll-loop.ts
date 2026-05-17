@@ -2,13 +2,17 @@ import { findByName, getAllDestinations, type DestinationEntry } from './destina
 import { getPendingMessages, markProcessing, markCompleted, type MessageInRow } from './db/messages-in.js';
 import { writeMessageOut } from './db/messages-out.js';
 import { touchHeartbeat, clearStaleProcessingAcks } from './db/connection.js';
+import { clearContinuation, migrateLegacyContinuation, setContinuation } from './db/session-state.js';
 import {
-  clearContinuation,
-  migrateLegacyContinuation,
-  setContinuation,
-} from './db/session-state.js';
-import { formatMessages, extractRouting, categorizeMessage, isClearCommand, stripInternalTags, type RoutingContext } from './formatter.js';
+  formatMessages,
+  extractRouting,
+  categorizeMessage,
+  isClearCommand,
+  stripInternalTags,
+  type RoutingContext,
+} from './formatter.js';
 import type { AgentProvider, AgentQuery, ProviderEvent } from './providers/types.js';
+import { shouldRotateSession } from './session-rotation.js';
 
 const POLL_INTERVAL_MS = 1000;
 const ACTIVE_POLL_INTERVAL_MS = 500;
@@ -171,7 +175,7 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
     const skippedSet = new Set(skipped);
     const processingIds = ids.filter((id) => !commandIds.includes(id) && !skippedSet.has(id));
     try {
-      const result = await processQuery(query, routing, processingIds, config.providerName);
+      const result = await processQuery(query, routing, processingIds, config.providerName, config.cwd);
       if (result.continuation && result.continuation !== continuation) {
         continuation = result.continuation;
         setContinuation(config.providerName, continuation);
@@ -250,9 +254,14 @@ async function processQuery(
   routing: RoutingContext,
   initialBatchIds: string[],
   providerName: string,
+  cwd: string,
 ): Promise<QueryResult> {
   let queryContinuation: string | undefined;
   let done = false;
+  // True while we're waiting for the SDK's `compact_boundary` result event
+  // after pushing our own `/compact`. Swallows the boundary event so the
+  // user doesn't see a "Context compacted..." message they didn't trigger.
+  let rotationInFlight = false;
 
   // Concurrent polling: push follow-ups into the active query as they arrive.
   // We do NOT force-end the stream on silence — keeping the query open is
@@ -302,6 +311,15 @@ async function processQuery(
         // Claude session with no prior context.
         setContinuation(providerName, event.continuation);
       } else if (event.type === 'result') {
+        if (rotationInFlight) {
+          // This is the `compact_boundary` reply to our own `/compact` push,
+          // not a user-driven turn — swallow it (don't dispatch, don't
+          // re-mark the initial batch). The user already saw the real reply
+          // before we kicked rotation.
+          log(`Rotation /compact completed${event.text ? `: ${event.text.slice(0, 80)}` : ''}`);
+          rotationInFlight = false;
+          continue;
+        }
         // A result — with or without text — means the turn is done. Mark
         // the initial batch completed now so the host sweep doesn't see
         // stale 'processing' claims while the query stays open for
@@ -311,6 +329,14 @@ async function processQuery(
         markCompleted(initialBatchIds);
         if (event.text) {
           dispatchResultText(event.text, routing);
+        }
+        // Proactive compact: kick `/compact` before the SDK's own ~165k
+        // token auto-compact would land, to keep turns snappy. Silent —
+        // the next `result` (the compact boundary) is swallowed above.
+        if (queryContinuation && shouldRotateSession(queryContinuation, cwd)) {
+          log('Session over threshold — pushing /compact');
+          rotationInFlight = true;
+          query.push('/compact');
         }
       }
     }
@@ -331,7 +357,9 @@ function handleEvent(event: ProviderEvent, _routing: RoutingContext): void {
       log(`Result: ${event.text ? event.text.slice(0, 200) : '(empty)'}`);
       break;
     case 'error':
-      log(`Error: ${event.message} (retryable: ${event.retryable}${event.classification ? `, ${event.classification}` : ''})`);
+      log(
+        `Error: ${event.message} (retryable: ${event.retryable}${event.classification ? `, ${event.classification}` : ''})`,
+      );
       break;
     case 'progress':
       log(`Progress: ${event.message}`);

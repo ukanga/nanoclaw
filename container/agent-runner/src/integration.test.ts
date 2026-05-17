@@ -1,10 +1,15 @@
 import { describe, it, expect, beforeEach, afterEach } from 'bun:test';
+import fs from 'fs';
+import os from 'os';
+import path from 'path';
 
 import { initTestSessionDb, closeSessionDb, getInboundDb, getOutboundDb } from './db/connection.js';
 import { getUndeliveredMessages } from './db/messages-out.js';
 import { getPendingMessages } from './db/messages-in.js';
+import { getContinuation } from './db/session-state.js';
 import { MockProvider } from './providers/mock.js';
 import { runPollLoop } from './poll-loop.js';
+import { transcriptPath } from './session-rotation.js';
 
 beforeEach(() => {
   initTestSessionDb();
@@ -21,7 +26,11 @@ afterEach(() => {
   closeSessionDb();
 });
 
-function insertMessage(id: string, content: object, opts?: { platformId?: string; channelType?: string; threadId?: string }) {
+function insertMessage(
+  id: string,
+  content: object,
+  opts?: { platformId?: string; channelType?: string; threadId?: string },
+) {
   getInboundDb()
     .prepare(
       `INSERT INTO messages_in (id, kind, timestamp, status, platform_id, channel_type, thread_id, content)
@@ -32,7 +41,11 @@ function insertMessage(id: string, content: object, opts?: { platformId?: string
 
 describe('poll loop integration', () => {
   it('should pick up a message, process it, and write a response', async () => {
-    insertMessage('m1', { sender: 'Alice', text: 'What is the meaning of life?' }, { platformId: 'chan-1', channelType: 'discord', threadId: 'thread-1' });
+    insertMessage(
+      'm1',
+      { sender: 'Alice', text: 'What is the meaning of life?' },
+      { platformId: 'chan-1', channelType: 'discord', threadId: 'thread-1' },
+    );
 
     const provider = new MockProvider({}, () => '<message to="discord-test">42</message>');
 
@@ -74,6 +87,93 @@ describe('poll loop integration', () => {
     await loopPromise.catch(() => {});
   });
 
+  describe('proactive /compact rotation', () => {
+    let tmpProjectsDir: string;
+    const originalProjectsDir = process.env.CLAUDE_PROJECTS_DIR;
+    const originalThreshold = process.env.AUTO_COMPACT_THRESHOLD_BYTES;
+
+    beforeEach(() => {
+      tmpProjectsDir = fs.mkdtempSync(path.join(os.tmpdir(), 'rotation-int-'));
+      process.env.CLAUDE_PROJECTS_DIR = tmpProjectsDir;
+      process.env.AUTO_COMPACT_THRESHOLD_BYTES = '500';
+    });
+
+    afterEach(() => {
+      fs.rmSync(tmpProjectsDir, { recursive: true, force: true });
+      if (originalProjectsDir === undefined) delete process.env.CLAUDE_PROJECTS_DIR;
+      else process.env.CLAUDE_PROJECTS_DIR = originalProjectsDir;
+      if (originalThreshold === undefined) delete process.env.AUTO_COMPACT_THRESHOLD_BYTES;
+      else process.env.AUTO_COMPACT_THRESHOLD_BYTES = originalThreshold;
+    });
+
+    it('pushes /compact when transcript exceeds threshold and swallows the boundary result', async () => {
+      insertMessage('m1', { sender: 'Alice', text: 'Hello' }, { platformId: 'chan-1', channelType: 'discord' });
+
+      const promptsReceived: string[] = [];
+      const provider = new MockProvider({}, (prompt) => {
+        promptsReceived.push(prompt);
+        // After init has fired, the continuation is persisted by the poll-loop.
+        // Write a transcript over the threshold so shouldRotateSession trips
+        // on the post-result check.
+        const continuation = getContinuation('mock');
+        if (continuation) {
+          const tp = transcriptPath(continuation, '/workspace/agent');
+          fs.mkdirSync(path.dirname(tp), { recursive: true });
+          fs.writeFileSync(tp, 'x'.repeat(2000));
+        }
+        return prompt === '/compact' ? 'Context compacted (100 tokens).' : '<message to="discord-test">hi</message>';
+      });
+
+      const controller = new AbortController();
+      const loopPromise = runPollLoopWithTimeout(provider, controller.signal, 3000, '/workspace/agent');
+
+      // Wait until rotation has fired (responseFactory invoked with `/compact`).
+      await waitFor(() => promptsReceived.includes('/compact'), 2500);
+      // Give the loop a beat to consume the boundary result event.
+      await sleep(100);
+      controller.abort();
+
+      expect(promptsReceived).toContain('/compact');
+
+      const out = getUndeliveredMessages();
+      // Only one outbound — the agent's real reply. The post-/compact
+      // "Context compacted" result must be swallowed, not dispatched.
+      expect(out).toHaveLength(1);
+      expect(JSON.parse(out[0].content).text).toBe('hi');
+
+      await loopPromise.catch(() => {});
+    });
+
+    it('does not push /compact when transcript is under the threshold', async () => {
+      insertMessage('m2', { sender: 'Bob', text: 'Quick' }, { platformId: 'chan-1', channelType: 'discord' });
+
+      const promptsReceived: string[] = [];
+      const provider = new MockProvider({}, (prompt) => {
+        promptsReceived.push(prompt);
+        const continuation = getContinuation('mock');
+        if (continuation) {
+          const tp = transcriptPath(continuation, '/workspace/agent');
+          fs.mkdirSync(path.dirname(tp), { recursive: true });
+          // Small transcript — well under the 500-byte threshold.
+          fs.writeFileSync(tp, 'x'.repeat(50));
+        }
+        return '<message to="discord-test">ok</message>';
+      });
+
+      const controller = new AbortController();
+      const loopPromise = runPollLoopWithTimeout(provider, controller.signal, 2500, '/workspace/agent');
+
+      await waitFor(() => getUndeliveredMessages().length > 0, 2000);
+      await sleep(200);
+      controller.abort();
+
+      expect(promptsReceived).not.toContain('/compact');
+      expect(getUndeliveredMessages()).toHaveLength(1);
+
+      await loopPromise.catch(() => {});
+    });
+  });
+
   it('should process messages arriving after loop starts', async () => {
     const provider = new MockProvider({}, () => '<message to="discord-test">Processed</message>');
     const controller = new AbortController();
@@ -94,12 +194,17 @@ describe('poll loop integration', () => {
 });
 
 // Helper: run poll loop until aborted or timeout
-async function runPollLoopWithTimeout(provider: MockProvider, signal: AbortSignal, timeoutMs: number): Promise<void> {
+async function runPollLoopWithTimeout(
+  provider: MockProvider,
+  signal: AbortSignal,
+  timeoutMs: number,
+  cwd: string = '/tmp',
+): Promise<void> {
   return Promise.race([
     runPollLoop({
       provider,
       providerName: 'mock',
-      cwd: '/tmp',
+      cwd,
     }),
     new Promise<void>((_, reject) => {
       signal.addEventListener('abort', () => reject(new Error('aborted')));
