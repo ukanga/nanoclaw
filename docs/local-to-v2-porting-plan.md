@@ -11,17 +11,24 @@ Scoping document for reimplementing the 80 `local`-branch commits on top of
 
 A direct merge is impractical because v2.0.0 is an architectural rewrite. This
 plan organises the local work into independent feature ports so each can land
-as its own PR on a fresh branch off `upstream/main`.
+as a discrete commit (or small commit series) on a `local-v2` integration
+branch built from `upstream/channels` / `upstream/main`.
 
 > **Update 2026-05-17 (execution-prep):** Most v1 channels and skills already
 > exist on the `upstream/channels` mega-branch — including a full
 > `src/channels/signal.ts` (983 lines), `signal.test.ts` (961 lines), and a
 > `.claude/skills/add-signal/` skill. Similarly `.claude/skills/claw/` exists.
 > §2.1 and §2.5 below have been revised accordingly. **The Signal "port"
-> shrinks from "implement from scratch" to "contribute the local-only
-> hardening commits as small targeted PRs against `upstream/channels` or
-> `upstream/main`."** Re-check the rest of §2 before starting work on each
-> item; expect more such discoveries.
+> shrinks from "implement from scratch" to "replay the local hardening
+> commits on top of `upstream/channels`."** Re-check the rest of §2 before
+> starting work on each item; expect more such discoveries.
+
+> **Update 2026-05-17 (no-PR scope):** This is a personal-fork integration,
+> not an upstream contribution effort. References to "PRs," "PR sequence,"
+> and "target branch" in earlier revisions of this document mean integration
+> commits onto a local `local-v2` branch — not pull requests against
+> `qwibitai/nanoclaw`. The numbered work items below are still independent
+> and ordered; just read "branch → integration step."
 
 ---
 
@@ -77,13 +84,13 @@ These mappings drive every per-feature port below.
   | `0513c83`, `f82252d`, `f2c1e6a`, `51c46b6`, `ada48be`, `6279306` | Attachment materialization + markers + tests | §2.2 |
   | `6979cf8`, `01f3879` | Prettier drift | Drop |
 
-- **v2 port targets (the actual PR scope):**
-  - **PR A — `fix/signal-send-retry-with-dedup`:** introduce a send-retry layer in `sendText` (and `sendAttachments`); use a single dedupe key that incorporates the attachment list; propagate failures up to `deliver`; exempt our own AbortController timeouts; floor retry delay on stale-connection errors; extend retry budget for attachment sends. (`d338917` + `0d874c2` + `43f8cfc` + `a0fc96c` + `5776b7f` + `84e4fbb` + `7c7a3e7` consolidated.) Target branch: `upstream/channels` (where signal.ts lives).
-  - **PR B — `log/signal-attachment-count`:** trivial log enrichment (`43349e9`). Target: `upstream/channels`.
+- **v2 integration target (the actual scope):**
+  - **Step 1a — `fix/signal-send-retry-with-dedup`** (already in worktree `/tmp/nanoclaw-signal-pr/`, 6 commits on top of `upstream/channels`): introduces a send-retry layer in `sendText` (and `sendAttachments`); uses a single dedupe key that incorporates the attachment fingerprint; propagates failures up to `deliver` so v2's `src/delivery.ts` can record them in `dropped_messages`; exempts our own `Signal RPC timeout:` errors from retry; floors retry delay on stale-connection errors; extends retry budget for attachment sends. Consolidates `d338917` + `0d874c2` + `43f8cfc` + `a0fc96c` + `5776b7f` + `84e4fbb` + `7c7a3e7`. Replay onto `local-v2` once that branch exists.
+  - **Step 1b — drop.** Local commit `43349e9` was an `attachmentCount`-on-`Signal message sent` log enrichment; in v2 the text and attachment sends produce separate log lines that already carry the count. No port needed.
 - **DB migration:** none.
 - **Dependencies:** none — these are in-file behaviour fixes on the existing v2 adapter. §2.2 (attachments) is the larger work and follows separately.
 - **Drop:** any standalone "implement Signal from scratch" effort; SKILL.md rewrite (upstream's covers it).
-- **Test surface:** read upstream `signal.test.ts` and add cases for the behaviours added in PR A. Don't wholesale-port the 1889-line local file; it contains attachment-flow tests (§2.2) and tests for behaviours upstream already covers.
+- **Test surface:** read upstream `signal.test.ts` and add cases for the behaviours added in step 1a. Don't wholesale-port the 1889-line local file; it contains attachment-flow tests (§2.2) and tests for behaviours upstream already covers.
 - **Verify-before-PR:** confirm that signal-cli's current `--tcp` JSON-RPC param is `textStyle` (singular, as upstream has it). Local commit `bc10c2e` flipped names; the live behaviour at signal-cli HEAD matters more than what either branch says.
 
 ### 2.2 Attachments end-to-end — **Large**
@@ -129,7 +136,7 @@ Three new modules. All assume single-shared-session DB on v1; v2 has split inbou
 
 - **Discovered state:** `.claude/skills/claw/` exists on `upstream/channels` with `SKILL.md` and `scripts/claw` (374 lines). Local has `scripts/claw` (479 lines, ~105 lines ahead) — same Python CLI, almost certainly older + smaller upstream.
 - **What it does:** standalone CLI to run a container agent without a chat channel, using OneCLI credential proxy.
-- **v2 port target:** diff `upstream/channels:.claude/skills/claw/scripts/claw` against `local:scripts/claw`; contribute the local-only deltas as a PR against `upstream/channels`. Drop the from-scratch port plan.
+- **v2 integration target:** diff `upstream/channels:.claude/skills/claw/scripts/claw` against `local:scripts/claw`; replay the local-only deltas as a commit on `local-v2`. Drop the from-scratch port plan.
 - **DB migration:** none.
 
 ### 2.6 Helper scripts — **Small**
@@ -178,33 +185,37 @@ All other features (Signal, sessions, delivery, scripts, container skills, agent
 
 ---
 
-## 4. Suggested PR sequence
+## 4. Suggested integration order
 
 Each row is an independent branch off `upstream/main`, mergeable on its own. Order maximises parallel work and unblocks dependents early.
 
-| # | Branch | Scope | Size | Target |
-|---|---|---|---|---|
-| 1a | `fix/signal-send-retry-with-dedup` | 2.1 retry layer + propagate failures + attachment-aware dedupe + AbortController exempt + stale-conn floor + attachment retry budget | S/M | `upstream/channels` |
-| 1b | `log/signal-attachment-count` | 2.1 attachmentCount in send log | XS | `upstream/channels` |
-| 2 | `feat/attachment-metadata` | 2.2 migration `016-` + storage plumbing only (no markers yet) | M | `upstream/main` |
-| 3 | `feat/attachment-markers` | 2.2 marker emission + parsing + bundling in send | M | `upstream/main` |
-| 4 | `feat/attachment-ttl-sweep` | 2.2 inbox/outbox TTL sweeper | S | `upstream/main` |
-| 5 | `feat/session-rotation` | 2.3 rotation + size helpers, adapted to two-DB split | M | `upstream/main` |
-| 6 | `feat/session-commands` | 2.3 admin commands behind v2 user-roles | M | `upstream/main` |
-| 7 | `feat/delivery-replay` | 2.4 — **only if** v2 `dropped_messages` doesn't already cover it | S | `upstream/main` |
-| 8 | `chore/vendor-container-skills` | 2.7 copy 10 container skills + sanity pass | S | `upstream/main` |
-| 9 | `feat/claw-cli-deltas` | 2.5 diff `local:scripts/claw` against `upstream/channels:.claude/skills/claw/scripts/claw`, contribute the ~105-line delta | S | `upstream/channels` |
-| 10 | `chore/helper-scripts` | 2.6 rewrite scripts on `ncl` | S | `upstream/main` |
-| 11 | `fix/agent-runner-reliability` | 2.8 surviving items | S | `upstream/main` |
-| 12 | `chore/docs-debug-checklist` | 2.9 doc deltas | S | `upstream/main` |
+Integration order onto `local-v2` (built off `upstream/channels` — which already carries the Signal channel, `add-signal`, and `claw` skills). Order maximises parallelism and unblocks dependents early.
+
+| # | Integration step | Scope | Size |
+|---|---|---|---|
+| 1a | Signal send retry + dedupe | 2.1 retry layer + propagate failures + attachment-aware dedupe + own-timeout exempt + stale-conn floor + attachment retry budget | S/M |
+| 2 | Attachment metadata | 2.2 migration `016-` + storage plumbing only (no markers yet) | M |
+| 3 | Attachment markers | 2.2 marker emission + parsing + bundling in send | M |
+| 4 | Attachment TTL sweep | 2.2 inbox/outbox TTL sweeper | S |
+| 5 | Session rotation | 2.3 rotation + size helpers, adapted to two-DB split | M |
+| 6 | Session commands | 2.3 admin commands behind v2 user-roles | M |
+| 7 | Delivery replay | 2.4 — **only if** v2 `dropped_messages` doesn't already cover it | S |
+| 8 | Vendor container skills | 2.7 copy 10 container skills + sanity pass | S |
+| 9 | `claw` deltas | 2.5 diff `local:scripts/claw` against `upstream/channels:.claude/skills/claw/scripts/claw`, replay the ~105-line delta | S |
+| 10 | Helper scripts | 2.6 rewrite scripts on `ncl` | S |
+| 11 | Agent-runner reliability | 2.8 surviving items | S |
+| 12 | Docs debug checklist | 2.9 doc deltas | S |
 
 Estimated total effort: ~0 L + ~5 M + ~7 S ≈ 2–3 focused weeks (was 3–4 before the `upstream/channels` discovery).
+
+**Work-in-progress branches preserved in the local git directory:**
+- `fix/signal-send-retry-with-dedup` (6 commits, +427 / −26, off `upstream/channels`) — work for step #1a; checked out in worktree `/tmp/nanoclaw-signal-pr/`. Merge into `local-v2` when that branch is created.
 
 ---
 
 ## 5. Verify-before-porting checklist
 
-Before writing code for each numbered branch above, confirm the v2 surface.
+Before writing code for each numbered step above, confirm the v2 surface.
 
 > **General rule from the 2026-05-17 discovery:** before scoping any branch
 > below, also `git ls-tree -r upstream/channels` for whatever the local file is.
