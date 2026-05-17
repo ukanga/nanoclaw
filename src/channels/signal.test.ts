@@ -1,4 +1,7 @@
 import { describe, it, expect, beforeEach, vi, afterEach } from 'vitest';
+import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 
 // --- Mocks ---
 
@@ -338,10 +341,274 @@ describe('SignalAdapter', () => {
     });
 
     // Inbound attachment cases (image, audio, oversize, 0-byte, missing,
-    // unsafe filename, double-extension) are covered by the new test block
-    // in `describe('inbound attachment materialization', …)` — to be added
-    // alongside this refactor. The old `[Image: <cache-path>]` test was
-    // removed when adapter switched to content.attachments[] with base64.
+    // unsafe filename, double-extension) live in the
+    // `inbound attachment materialization` describe block below. The old
+    // `[Image: <cache-path>]` test was removed when the adapter switched to
+    // content.attachments[] with base64.
+  });
+
+  // --- Inbound attachment materialization ---
+
+  describe('inbound attachment materialization', () => {
+    let tmpDataDir: string;
+    let cacheDir: string;
+
+    beforeEach(() => {
+      tmpDataDir = mkdtempSync(join(tmpdir(), 'signal-attach-test-'));
+      cacheDir = join(tmpDataDir, 'attachments');
+      mkdirSync(cacheDir, { recursive: true });
+    });
+
+    afterEach(() => {
+      try {
+        rmSync(tmpDataDir, { recursive: true, force: true });
+      } catch {
+        /* ignore */
+      }
+    });
+
+    function createAdapterWithCache() {
+      return createSignalAdapter({
+        cliPath: 'signal-cli',
+        account: '+15551234567',
+        tcpHost: '127.0.0.1',
+        tcpPort: 7583,
+        manageDaemon: false,
+        signalDataDir: tmpDataDir,
+      });
+    }
+
+    it('materializes a base64 image attachment with a sanitized name', async () => {
+      const id = 'imgABCD';
+      const bytes = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x01]);
+      writeFileSync(join(cacheDir, id), bytes);
+
+      const adapter = createAdapterWithCache();
+      const cfg = createMockSetup();
+      await adapter.setup(cfg);
+
+      pushEvent({
+        sourceNumber: '+15555550123',
+        sourceName: 'Alice',
+        dataMessage: {
+          timestamp: 1700000000000,
+          message: 'check this out',
+          attachments: [{ id, contentType: 'image/png', filename: 'fancy pic.png', size: bytes.length }],
+        },
+      });
+      await new Promise((r) => setTimeout(r, 50));
+
+      expect(cfg.onInbound).toHaveBeenCalledTimes(1);
+      const inboundArg = (cfg.onInbound as unknown as ReturnType<typeof vi.fn>).mock.calls[0][2];
+      expect(inboundArg.content.text).toBe('check this out');
+      expect(inboundArg.content.text).not.toMatch(/\[Image:/);
+      expect(inboundArg.content.attachments).toEqual([
+        expect.objectContaining({
+          name: 'fancy_pic.png',
+          type: 'image',
+          mimeType: 'image/png',
+          size: bytes.length,
+          data: bytes.toString('base64'),
+        }),
+      ]);
+
+      await adapter.teardown();
+    });
+
+    it('does not double-extension when the signal-cli id already carries one', async () => {
+      // Reproduces the v1 bug fixed by commit 62c6f36: signal-cli ids of the
+      // form `wx58uQ.png` were producing `attachment-wx58uQ.png.png`.
+      const id = 'wx58uQ.png';
+      const bytes = Buffer.from('fake png bytes');
+      writeFileSync(join(cacheDir, id), bytes);
+
+      const adapter = createAdapterWithCache();
+      const cfg = createMockSetup();
+      await adapter.setup(cfg);
+
+      pushEvent({
+        sourceNumber: '+15555550123',
+        dataMessage: {
+          timestamp: 1700000000000,
+          message: 'photo',
+          // filename intentionally omitted — sanitizer falls back to attachment-<id>
+          attachments: [{ id, contentType: 'image/png', size: bytes.length }],
+        },
+      });
+      await new Promise((r) => setTimeout(r, 50));
+
+      const inboundArg = (cfg.onInbound as unknown as ReturnType<typeof vi.fn>).mock.calls[0][2];
+      const name = inboundArg.content.attachments[0].name as string;
+      expect(name).not.toMatch(/\.png\.png$/);
+      expect(name).toBe('attachment-wx58uQ.png');
+
+      await adapter.teardown();
+    });
+
+    it('skips an oversize attachment while keeping a sibling under the cap', async () => {
+      // The oversize check fires off the declared `size` field before the
+      // file is even read, so we don't need to actually write 25MB on disk.
+      const bigId = 'bigFile';
+      writeFileSync(join(cacheDir, bigId), Buffer.from('x'));
+
+      const okId = 'okFile';
+      const okBytes = Buffer.from('small payload');
+      writeFileSync(join(cacheDir, okId), okBytes);
+
+      const adapter = createAdapterWithCache();
+      const cfg = createMockSetup();
+      await adapter.setup(cfg);
+
+      pushEvent({
+        sourceNumber: '+15555550123',
+        dataMessage: {
+          timestamp: 1700000000000,
+          message: 'two attachments',
+          attachments: [
+            {
+              id: bigId,
+              contentType: 'application/pdf',
+              filename: 'huge.pdf',
+              size: 30 * 1024 * 1024,
+            },
+            { id: okId, contentType: 'text/plain', filename: 'small.txt', size: okBytes.length },
+          ],
+        },
+      });
+      await new Promise((r) => setTimeout(r, 50));
+
+      const inboundArg = (cfg.onInbound as unknown as ReturnType<typeof vi.fn>).mock.calls[0][2];
+      expect(inboundArg.content.attachments).toHaveLength(1);
+      expect(inboundArg.content.attachments[0].name).toBe('small.txt');
+
+      await adapter.teardown();
+    });
+
+    it('drops a 0-byte placeholder attachment and warns with placeholder: true', async () => {
+      const { log } = (await import('../log.js')) as { log: { warn: ReturnType<typeof vi.fn> } };
+      const id = 'failedDownload';
+      writeFileSync(join(cacheDir, id), Buffer.alloc(0));
+
+      const adapter = createAdapterWithCache();
+      const cfg = createMockSetup();
+      await adapter.setup(cfg);
+      (log.warn as ReturnType<typeof vi.fn>).mockClear();
+
+      pushEvent({
+        sourceNumber: '+15555550123',
+        dataMessage: {
+          timestamp: 1700000000000,
+          // No text — this attachment is the only payload, so when it's
+          // dropped the adapter has nothing to forward.
+          attachments: [{ id, contentType: 'image/png', filename: 'broken.png', size: 1234 }],
+        },
+      });
+      await new Promise((r) => setTimeout(r, 50));
+
+      expect(cfg.onInbound).not.toHaveBeenCalled();
+      const warnedWithPlaceholder = (log.warn as ReturnType<typeof vi.fn>).mock.calls.some(
+        (call) => (call[1] as { placeholder?: boolean } | undefined)?.placeholder === true,
+      );
+      expect(warnedWithPlaceholder).toBe(true);
+
+      await adapter.teardown();
+    });
+
+    it('skips silently with a warn when no cache file exists for the id', async () => {
+      const { log } = (await import('../log.js')) as { log: { warn: ReturnType<typeof vi.fn> } };
+      const id = 'neverDownloaded';
+      // Do NOT write any file for `id`.
+
+      const adapter = createAdapterWithCache();
+      const cfg = createMockSetup();
+      await adapter.setup(cfg);
+      (log.warn as ReturnType<typeof vi.fn>).mockClear();
+
+      pushEvent({
+        sourceNumber: '+15555550123',
+        dataMessage: {
+          timestamp: 1700000000000,
+          attachments: [{ id, contentType: 'image/jpeg', filename: 'pic.jpg', size: 1024 }],
+        },
+      });
+      await new Promise((r) => setTimeout(r, 50));
+
+      expect(cfg.onInbound).not.toHaveBeenCalled();
+      const warnedMissing = (log.warn as ReturnType<typeof vi.fn>).mock.calls.some((call) => {
+        const msg = String(call[0]);
+        const ctx = call[1] as { placeholder?: boolean } | undefined;
+        return /attachment cache file missing/.test(msg) && ctx?.placeholder === false;
+      });
+      expect(warnedMissing).toBe(true);
+
+      await adapter.teardown();
+    });
+
+    it('sanitizes a path-traversal filename', async () => {
+      const id = 'sneaky';
+      const bytes = Buffer.from('payload');
+      writeFileSync(join(cacheDir, id), bytes);
+
+      const adapter = createAdapterWithCache();
+      const cfg = createMockSetup();
+      await adapter.setup(cfg);
+
+      pushEvent({
+        sourceNumber: '+15555550123',
+        dataMessage: {
+          timestamp: 1700000000000,
+          message: 'evil',
+          attachments: [
+            {
+              id,
+              contentType: 'application/octet-stream',
+              filename: '../../etc/passwd',
+              size: bytes.length,
+            },
+          ],
+        },
+      });
+      await new Promise((r) => setTimeout(r, 50));
+
+      const name = (cfg.onInbound as unknown as ReturnType<typeof vi.fn>).mock.calls[0][2].content.attachments[0]
+        .name as string;
+      expect(name).not.toContain('/');
+      expect(name).not.toContain('\\');
+      expect(name).not.toMatch(/\.\./);
+
+      await adapter.teardown();
+    });
+
+    it('emits a voice-only message with [Voice Message] text and the audio attachment', async () => {
+      const id = 'voiceClip';
+      const bytes = Buffer.from('fake-ogg-bytes');
+      writeFileSync(join(cacheDir, id), bytes);
+
+      const adapter = createAdapterWithCache();
+      const cfg = createMockSetup();
+      await adapter.setup(cfg);
+
+      pushEvent({
+        sourceNumber: '+15555550123',
+        sourceName: 'Alice',
+        dataMessage: {
+          timestamp: 1700000000000,
+          // No message text — voice-only envelope.
+          attachments: [{ id, contentType: 'audio/ogg', size: bytes.length }],
+        },
+      });
+      await new Promise((r) => setTimeout(r, 50));
+
+      const inboundArg = (cfg.onInbound as unknown as ReturnType<typeof vi.fn>).mock.calls[0][2];
+      // No WHISPER_BIN / OPENAI_API_KEY in this test env, so transcription
+      // falls back to the placeholder text.
+      expect(inboundArg.content.text).toBe('[Voice Message]');
+      expect(inboundArg.content.attachments).toEqual([
+        expect.objectContaining({ type: 'audio', mimeType: 'audio/ogg' }),
+      ]);
+
+      await adapter.teardown();
+    });
   });
 
   // --- groupV2 ---

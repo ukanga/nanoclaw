@@ -894,6 +894,12 @@ export function createSignalAdapter(config: {
       });
     }
 
+    // The early-return at the top of this function only filters envelopes
+    // that have no text, voice, or attachments at all. When the envelope
+    // *only* carried attachments and every one was rejected here (0-byte
+    // placeholder / missing cache / oversize), there is nothing to forward.
+    if (!content && attachments.length === 0) return;
+
     const msg: InboundMessage = {
       id: String(dataMessage.timestamp ?? Date.now()),
       kind: 'chat',
