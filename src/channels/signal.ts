@@ -843,13 +843,16 @@ export function createSignalAdapter(config: {
         } catch (err) {
           lastErr = err;
           if (!isRetryableSendError(err) || attempt >= maxRetries) break;
-          const delay = SEND_BACKOFF_MS[attempt]!;
+          const baseDelay = SEND_BACKOFF_MS[attempt]!;
+          const stale = isStaleConnectionError(err);
+          const delay = stale ? Math.max(baseDelay, STALE_CONNECTION_MIN_DELAY_MS) : baseDelay;
           log.warn('Signal: transient send error, retrying', {
             platformId,
             chunkIndex: i,
             attempt: attempt + 1,
             maxRetries,
             delayMs: delay,
+            stale,
             err: errMessage(err),
           });
           await sleepMs(delay);
@@ -914,13 +917,16 @@ export function createSignalAdapter(config: {
         } catch (err) {
           lastErr = err;
           if (!isRetryableSendError(err) || attempt >= maxRetries) break;
-          const delay = ATTACHMENT_SEND_BACKOFF_MS[attempt]!;
+          const baseDelay = ATTACHMENT_SEND_BACKOFF_MS[attempt]!;
+          const stale = isStaleConnectionError(err);
+          const delay = stale ? Math.max(baseDelay, STALE_CONNECTION_MIN_DELAY_MS) : baseDelay;
           log.warn('Signal: transient attachment send error, retrying', {
             platformId,
             count: files.length,
             attempt: attempt + 1,
             maxRetries,
             delayMs: delay,
+            stale,
             err: errMessage(err),
           });
           await sleepMs(delay);
