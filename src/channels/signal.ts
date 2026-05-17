@@ -120,11 +120,7 @@ const ATTACHMENT_SEND_BACKOFF_MS = [2_000, 5_000, 15_000, 30_000];
 // reconnect takes several seconds under load. Retrying inside that window
 // keeps hitting the same broken socket. Floor the retry delay on these
 // errors so the reconnect can land before our next attempt.
-const STALE_CONNECTION_PATTERNS: RegExp[] = [
-  /bad_record_mac/,
-  /Broken pipe/,
-  /PushNetworkException/,
-];
+const STALE_CONNECTION_PATTERNS: RegExp[] = [/bad_record_mac/, /Broken pipe/, /PushNetworkException/];
 const STALE_CONNECTION_MIN_DELAY_MS = 15_000;
 
 function errMessage(err: unknown): string {
@@ -803,35 +799,69 @@ export function createSignalAdapter(config: {
     const MAX_CHUNK = 4000;
     const chunks = text.length <= MAX_CHUNK ? [text] : chunkText(text, MAX_CHUNK);
 
-    for (const chunk of chunks) {
-      try {
-        const { text: plainText, textStyles } = parseSignalStyles(chunk);
-        const params: Record<string, unknown> = { message: plainText };
-        if (config.account) params.account = config.account;
-        if (textStyles.length > 0) {
-          params.textStyle = textStyles.map((s) => `${s.start}:${s.length}:${s.style}`);
-        }
+    for (let i = 0; i < chunks.length; i++) {
+      const chunk = chunks[i]!;
+      const { text: plainText, textStyles } = parseSignalStyles(chunk);
+      const params: Record<string, unknown> = { message: plainText };
+      if (config.account) params.account = config.account;
+      if (textStyles.length > 0) {
+        params.textStyle = textStyles.map((s) => `${s.start}:${s.length}:${s.style}`);
+      }
 
-        if (platformId.startsWith('group:')) {
-          params.groupId = platformId.slice('group:'.length);
-        } else {
-          params.recipient = [platformId];
-        }
+      if (platformId.startsWith('group:')) {
+        params.groupId = platformId.slice('group:'.length);
+      } else {
+        params.recipient = [platformId];
+      }
 
+      // Two retry layers stack here:
+      //  1. textStyle-rejection fallback (one-shot): if signal-cli rejects the
+      //     style params, retry without them so unstyled text still lands.
+      //  2. transient-failure retry loop: if a send hits a retryable network
+      //     error (UND_ERR_SOCKET, PushNetworkException, etc.), back off and
+      //     retry. Exhaust → propagate so the delivery layer can record the
+      //     failure in dropped_messages.
+      const maxRetries = SEND_BACKOFF_MS.length;
+      let lastErr: unknown = null;
+      for (let attempt = 0; attempt <= maxRetries; attempt++) {
         try {
-          await tcp.rpc('send', params);
-        } catch (styledErr) {
-          if (textStyles.length > 0) {
-            log.debug('Signal: textStyle rejected, retrying with markup');
-            delete params.textStyle;
-            params.message = chunk;
+          try {
             await tcp.rpc('send', params);
-          } else {
-            throw styledErr;
+          } catch (styledErr) {
+            if (textStyles.length > 0) {
+              log.debug('Signal: textStyle rejected, retrying without styles');
+              delete params.textStyle;
+              params.message = chunk;
+              await tcp.rpc('send', params);
+            } else {
+              throw styledErr;
+            }
           }
+          lastErr = null;
+          break;
+        } catch (err) {
+          lastErr = err;
+          if (!isRetryableSendError(err) || attempt >= maxRetries) break;
+          const delay = SEND_BACKOFF_MS[attempt]!;
+          log.warn('Signal: transient send error, retrying', {
+            platformId,
+            chunkIndex: i,
+            attempt: attempt + 1,
+            maxRetries,
+            delayMs: delay,
+            err: errMessage(err),
+          });
+          await sleepMs(delay);
         }
-      } catch (err) {
-        log.error('Signal: send failed', { platformId, err });
+      }
+
+      if (lastErr) {
+        // Propagate so the delivery layer (src/delivery.ts) sees the failure
+        // and routes it through MAX_DELIVERY_ATTEMPTS / markDeliveryFailed.
+        // Previous behaviour swallowed the error and logged a false-success
+        // "Signal message sent" below, making delivery failures invisible.
+        log.error('Signal: send failed', { platformId, chunkIndex: i, err: errMessage(lastErr) });
+        throw lastErr;
       }
     }
 
