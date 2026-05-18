@@ -638,6 +638,106 @@ describe('SignalAdapter', () => {
 
   // --- mention resolution ---
 
+  describe('mention detection (isMention flag)', () => {
+    it('sets isMention=true on DMs unconditionally', async () => {
+      const adapter = createAdapter();
+      const cfg = createMockSetup();
+      await adapter.setup(cfg);
+
+      pushEvent({
+        sourceNumber: '+15555550123',
+        sourceName: 'Alice',
+        dataMessage: { timestamp: 1700000000001, message: 'hi' },
+      });
+
+      await new Promise((r) => setTimeout(r, 50));
+      expect(cfg.onInbound).toHaveBeenCalledWith(
+        '+15555550123',
+        null,
+        expect.objectContaining({ isMention: true, isGroup: false }),
+      );
+
+      await adapter.teardown();
+    });
+
+    it('sets isMention=true in a group when bot account is in mentions[]', async () => {
+      const adapter = createAdapter();
+      const cfg = createMockSetup();
+      await adapter.setup(cfg);
+
+      pushEvent({
+        sourceNumber: '+15555550123',
+        sourceName: 'Alice',
+        dataMessage: {
+          timestamp: 1700000000002,
+          message: '￼ ping',
+          mentions: [{ start: 0, length: 1, name: 'Bot', number: '+15551234567', uuid: 'bot-uuid' }],
+          groupV2: { id: 'AAAA' },
+        },
+      });
+
+      await new Promise((r) => setTimeout(r, 50));
+      expect(cfg.onInbound).toHaveBeenCalledWith(
+        'group:AAAA',
+        null,
+        expect.objectContaining({ isMention: true, isGroup: true }),
+      );
+
+      await adapter.teardown();
+    });
+
+    it('sets isMention=false in a group when bot is not mentioned', async () => {
+      const adapter = createAdapter();
+      const cfg = createMockSetup();
+      await adapter.setup(cfg);
+
+      pushEvent({
+        sourceNumber: '+15555550123',
+        sourceName: 'Alice',
+        dataMessage: {
+          timestamp: 1700000000003,
+          message: 'just talking',
+          groupV2: { id: 'BBBB' },
+        },
+      });
+
+      await new Promise((r) => setTimeout(r, 50));
+      expect(cfg.onInbound).toHaveBeenCalledWith(
+        'group:BBBB',
+        null,
+        expect.objectContaining({ isMention: false, isGroup: true }),
+      );
+
+      await adapter.teardown();
+    });
+
+    it('does not match when only a different account is mentioned in a group', async () => {
+      const adapter = createAdapter();
+      const cfg = createMockSetup();
+      await adapter.setup(cfg);
+
+      pushEvent({
+        sourceNumber: '+15555550123',
+        sourceName: 'Alice',
+        dataMessage: {
+          timestamp: 1700000000004,
+          message: '￼ hey',
+          mentions: [{ start: 0, length: 1, name: 'Carol', number: '+15559998888' }],
+          groupV2: { id: 'CCCC' },
+        },
+      });
+
+      await new Promise((r) => setTimeout(r, 50));
+      expect(cfg.onInbound).toHaveBeenCalledWith(
+        'group:CCCC',
+        null,
+        expect.objectContaining({ isMention: false, isGroup: true }),
+      );
+
+      await adapter.teardown();
+    });
+  });
+
   describe('mention resolution', () => {
     it('replaces inline mention placeholders with display names', async () => {
       const adapter = createAdapter();

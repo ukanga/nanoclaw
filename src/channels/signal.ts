@@ -504,6 +504,20 @@ interface SignalEnvelope {
  * agent sees `@Alice` instead of a raw UUID. Signal's protocol uses a single
  * placeholder character (typically U+FFFC) at each mention's `start` offset.
  */
+/**
+ * True when the bot's own account appears in this message's structured
+ * mentions. signal-cli populates `mention.number` whenever the mentioned
+ * user has a phone-number identity (the normal case for the bot itself).
+ * UUID-only matching would be more robust but requires the bot's UUID,
+ * which isn't in `config` today — match by phone for now.
+ */
+function isBotMentioned(mentions: SignalMention[] | undefined, botAccount: string): boolean {
+  if (!mentions || mentions.length === 0) return false;
+  const target = botAccount.trim();
+  if (!target) return false;
+  return mentions.some((m) => (m.number ?? '').trim() === target);
+}
+
 function resolveMentions(text: string, mentions?: SignalMention[]): string {
   if (!mentions || mentions.length === 0) return text;
   const sorted = [...mentions].sort((a, b) => (a.start ?? 0) - (b.start ?? 0));
@@ -736,6 +750,9 @@ export function createSignalAdapter(config: {
         const msg: InboundMessage = {
           id: String(syncSent.timestamp ?? Date.now()),
           kind: 'chat',
+          // Note-to-Self is a DM to the bot itself — always "mentioned".
+          isMention: true,
+          isGroup: false,
           content: {
             text,
             sender: config.account,
@@ -900,9 +917,18 @@ export function createSignalAdapter(config: {
     // placeholder / missing cache / oversize), there is nothing to forward.
     if (!content && attachments.length === 0) return;
 
+    // DMs are implicitly addressed to the bot (no @mention possible /
+    // necessary). In a group, fall back to the platform-confirmed
+    // signal-cli `mentions[]` so `engage_mode='mention'` /
+    // 'mention-sticky' wirings can fire on the first message instead of
+    // waiting for a sticky session that will never exist.
+    const isMention = !isGroup || isBotMentioned(dataMessage.mentions, config.account);
+
     const msg: InboundMessage = {
       id: String(dataMessage.timestamp ?? Date.now()),
       kind: 'chat',
+      isMention,
+      isGroup,
       content: {
         text: content,
         sender,
@@ -915,7 +941,7 @@ export function createSignalAdapter(config: {
     };
     await setup.onInbound(platformId, null, msg);
 
-    log.info('Signal message received', { platformId, sender: senderName });
+    log.info('Signal message received', { platformId, sender: senderName, isMention, isGroup });
   }
 
   /**
