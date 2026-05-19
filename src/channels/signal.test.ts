@@ -926,7 +926,7 @@ describe('SignalAdapter', () => {
       await adapter.teardown();
     });
 
-    it('sends text first, then attachment, when both are present', async () => {
+    it('combines short caption + attachment into a single send RPC', async () => {
       const adapter = createAdapter();
       await adapter.setup(createMockSetup());
       tcpRef.fakeSocket.write.mockClear();
@@ -937,17 +937,41 @@ describe('SignalAdapter', () => {
         files: [{ filename: 'digest.md', data: Buffer.from('content') }],
       });
 
+      // One bubble: signal-cli renders message + attachments[] as a single
+      // Signal message with the caption beneath the file.
       const sendCalls = getRpcCallsForMethod('send');
-      expect(sendCalls).toHaveLength(2);
-      // First call: text message
-      expect(sendCalls[0].params).toEqual(
-        expect.objectContaining({ message: 'Here is the digest', recipient: ['+15555550123'] }),
-      );
-      expect((sendCalls[0].params as Record<string, unknown>).attachments).toBeUndefined();
-      // Second call: attachment, no message
-      expect(sendCalls[1].params).toEqual(expect.objectContaining({ recipient: ['+15555550123'] }));
-      const attachments = (sendCalls[1].params as Record<string, unknown>).attachments as string[];
+      expect(sendCalls).toHaveLength(1);
+      const params = sendCalls[0].params as Record<string, unknown>;
+      expect(params.message).toBe('Here is the digest');
+      expect(params.recipient).toEqual(['+15555550123']);
+      const attachments = params.attachments as string[];
       expect(attachments).toHaveLength(1);
+      expect(attachments[0]).toMatch(/\/digest\.md$/);
+
+      await adapter.teardown();
+    });
+
+    it('falls back to separate text + attachment sends when caption exceeds chunk size', async () => {
+      const adapter = createAdapter();
+      await adapter.setup(createMockSetup());
+      tcpRef.fakeSocket.write.mockClear();
+
+      const longCaption = 'x'.repeat(5000);
+      await adapter.deliver('+15555550123', null, {
+        kind: 'file',
+        content: { text: longCaption },
+        files: [{ filename: 'big.md', data: Buffer.from('content') }],
+      });
+
+      // chunkText produces 2 text sends (4000 + 1000), then 1 captionless
+      // attachment send.
+      const sendCalls = getRpcCallsForMethod('send');
+      expect(sendCalls).toHaveLength(3);
+      expect((sendCalls[0].params as Record<string, unknown>).attachments).toBeUndefined();
+      expect((sendCalls[1].params as Record<string, unknown>).attachments).toBeUndefined();
+      const last = sendCalls[2].params as Record<string, unknown>;
+      expect(last.message).toBeUndefined();
+      expect((last.attachments as string[]).length).toBe(1);
 
       await adapter.teardown();
     });
@@ -1457,9 +1481,10 @@ describe('SignalAdapter', () => {
         files: [{ filename: 'b.txt', data: Buffer.from('BBBB') }],
       });
 
-      // Each deliver: 1 send for caption text + 1 send for attachment = 2.
-      // Two deliveries should produce 4 sends total when dedupe is fingerprint-aware.
-      expect(getRpcCallsForMethod('send')).toHaveLength(4);
+      // Each deliver combines caption + attachment into a single send.
+      // Two deliveries should produce 2 sends total when dedupe is
+      // fingerprint-aware (same caption, different files → distinct keys).
+      expect(getRpcCallsForMethod('send')).toHaveLength(2);
 
       await adapter.teardown();
     });

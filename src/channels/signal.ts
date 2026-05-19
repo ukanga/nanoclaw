@@ -203,6 +203,11 @@ const RETRYABLE_SEND_PATTERNS: RegExp[] = [
 const SEND_BACKOFF_MS = [2_000, 5_000];
 const ATTACHMENT_SEND_BACKOFF_MS = [2_000, 5_000, 15_000, 30_000];
 
+// Max body length sent as a single Signal `send` RPC. Captions on attachments
+// share this limit — anything longer falls back to a separate text send so the
+// chunking path (sendText) can split it.
+const SIGNAL_SEND_MAX_CHUNK = 4_000;
+
 // Subset of retryable errors that indicate signal-cli's push connection to
 // Signal's servers is dead. signal-cli reconnects internally — it logs
 // "Connection closed unexpectedly, reconnecting in 100 ms" — but the actual
@@ -982,8 +987,8 @@ export function createSignalAdapter(config: {
 
     echoCache.remember(platformId, text);
 
-    const MAX_CHUNK = 4000;
-    const chunks = text.length <= MAX_CHUNK ? [text] : chunkText(text, MAX_CHUNK);
+    const chunks =
+      text.length <= SIGNAL_SEND_MAX_CHUNK ? [text] : chunkText(text, SIGNAL_SEND_MAX_CHUNK);
 
     for (let i = 0; i < chunks.length; i++) {
       const chunk = chunks[i]!;
@@ -1063,11 +1068,18 @@ export function createSignalAdapter(config: {
    * Buffer is materialized to an OS temp file so signal-cli can read it, then
    * removed in the finally block.
    *
-   * Caption text, if any, is sent first via `sendText` (which handles chunking
-   * + textStyles) — keeps this function single-purpose and avoids a long
-   * caption colliding with signal-cli's per-message size limits.
+   * Optional `caption` is inlined as the `message` field of the same RPC so
+   * the recipient sees one bubble (file + caption beneath) instead of a
+   * separate text bubble followed by the file. Callers must only pass a
+   * caption that fits in a single chunk (≤ SIGNAL_SEND_MAX_CHUNK); longer
+   * text should be routed through sendText first and this function called
+   * with no caption.
    */
-  async function sendAttachments(platformId: string, files: { filename: string; data: Buffer }[]): Promise<void> {
+  async function sendAttachments(
+    platformId: string,
+    files: { filename: string; data: Buffer }[],
+    caption?: string,
+  ): Promise<void> {
     if (!connected || !tcp) return;
     if (files.length === 0) return;
 
@@ -1094,6 +1106,17 @@ export function createSignalAdapter(config: {
         params.recipient = [platformId];
       }
 
+      let captionStyled = false;
+      if (caption) {
+        const { text: plainText, textStyles } = parseSignalStyles(caption);
+        params.message = plainText;
+        if (textStyles.length > 0) {
+          params.textStyle = textStyles.map((s) => `${s.start}:${s.length}:${s.style}`);
+          captionStyled = true;
+        }
+        echoCache.remember(platformId, caption);
+      }
+
       // Attachment sends get a longer retry budget than text sends. Push
       // connections drop more often when the host is uploading bytes, and
       // signal-cli's ReceiveHelper needs several seconds under load before
@@ -1102,7 +1125,21 @@ export function createSignalAdapter(config: {
       let lastErr: unknown = null;
       for (let attempt = 0; attempt <= maxRetries; attempt++) {
         try {
-          await tcp.rpc('send', params);
+          try {
+            await tcp.rpc('send', params);
+          } catch (styledErr) {
+            // Same one-shot fallback as sendText: if signal-cli rejects the
+            // caption's textStyle params, strip them and retry so the file
+            // (and unstyled caption) still lands.
+            if (captionStyled) {
+              log.debug('Signal: attachment caption textStyle rejected, retrying without styles');
+              delete params.textStyle;
+              captionStyled = false;
+              await tcp.rpc('send', params);
+            } else {
+              throw styledErr;
+            }
+          }
           lastErr = null;
           break;
         } catch (err) {
@@ -1276,11 +1313,20 @@ export function createSignalAdapter(config: {
         return undefined;
       }
 
-      // Send accompanying text first so it lands above the attachment(s) in
-      // the recipient's chat. Both branches no-op cleanly if their input is
-      // empty, so any combination of (text, files) works.
-      if (text) await sendText(platformId, text);
-      if (files.length > 0) await sendAttachments(platformId, files);
+      // Caption + file in a single Signal bubble when the caption fits in
+      // one chunk: pass `message` alongside `attachments` in one RPC so the
+      // recipient sees `budget-final.xlsx` with its caption beneath, instead
+      // of a stray text bubble followed by the file bubble.
+      //
+      // Long captions still go via sendText (which chunks) followed by a
+      // captionless sendAttachments — the alternative would be to truncate or
+      // duplicate the caption across bubbles, which is worse than the split.
+      if (files.length > 0 && text && text.length <= SIGNAL_SEND_MAX_CHUNK) {
+        await sendAttachments(platformId, files, text);
+      } else {
+        if (text) await sendText(platformId, text);
+        if (files.length > 0) await sendAttachments(platformId, files);
+      }
       return undefined;
     },
 
