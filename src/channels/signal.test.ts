@@ -917,7 +917,9 @@ describe('SignalAdapter', () => {
       expect(params.message).toBeUndefined();
       const paths = params.attachments as string[];
       expect(paths).toHaveLength(1);
-      expect(paths[0]).toMatch(/signal-out-\d+-[a-z0-9]+-report\.md$/);
+      // Each attachment lives in its own mkdtemp dir so the recipient sees
+      // the clean basename (no signal-out-... prefix on the filename itself).
+      expect(paths[0]).toMatch(/signal-out-[a-zA-Z0-9]+\/report\.md$/);
       // Temp file should no longer exist — finally{} cleanup ran
       expect(fs.existsSync(paths[0])).toBe(false);
 
@@ -968,8 +970,8 @@ describe('SignalAdapter', () => {
       expect(sendCalls).toHaveLength(1);
       const attachments = (sendCalls[0].params as Record<string, unknown>).attachments as string[];
       expect(attachments).toHaveLength(2);
-      expect(attachments[0]).toMatch(/-a\.txt$/);
-      expect(attachments[1]).toMatch(/-b\.png$/);
+      expect(attachments[0]).toMatch(/\/a\.txt$/);
+      expect(attachments[1]).toMatch(/\/b\.png$/);
 
       await adapter.teardown();
     });

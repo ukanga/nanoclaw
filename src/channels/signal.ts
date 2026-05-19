@@ -8,7 +8,16 @@
  * Ported from v1 — see v1 source for commit history.
  */
 import { execFileSync, execSync, spawn } from 'node:child_process';
-import { existsSync, readFileSync, readdirSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
+import {
+  existsSync,
+  mkdtempSync,
+  readFileSync,
+  readdirSync,
+  rmSync,
+  statSync,
+  unlinkSync,
+  writeFileSync,
+} from 'node:fs';
 import { createConnection, type Socket } from 'node:net';
 import { homedir, tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -1062,11 +1071,17 @@ export function createSignalAdapter(config: {
     if (!connected || !tcp) return;
     if (files.length === 0) return;
 
+    // Each attachment goes in its own mkdtemp directory so signal-cli sees the
+    // file by its clean basename — recipients see `budget-final.xlsx`, not
+    // `signal-out-<timestamp>-<rand>-budget-final.xlsx`.
+    const tempDirs: string[] = [];
     const tempPaths: string[] = [];
     for (const file of files) {
       const safeName = file.filename.replace(/[/\\\0]/g, '_');
-      const tempPath = join(tmpdir(), `signal-out-${Date.now()}-${Math.random().toString(36).slice(2, 8)}-${safeName}`);
+      const tempDir = mkdtempSync(join(tmpdir(), 'signal-out-'));
+      const tempPath = join(tempDir, safeName);
       writeFileSync(tempPath, file.data);
+      tempDirs.push(tempDir);
       tempPaths.push(tempPath);
     }
 
@@ -1122,9 +1137,9 @@ export function createSignalAdapter(config: {
 
       log.info('Signal attachments sent', { platformId, count: files.length, filenames: files.map((f) => f.filename) });
     } finally {
-      for (const p of tempPaths) {
+      for (const d of tempDirs) {
         try {
-          unlinkSync(p);
+          rmSync(d, { recursive: true, force: true });
         } catch {
           /* best-effort cleanup */
         }
