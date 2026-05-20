@@ -987,8 +987,7 @@ export function createSignalAdapter(config: {
 
     echoCache.remember(platformId, text);
 
-    const chunks =
-      text.length <= SIGNAL_SEND_MAX_CHUNK ? [text] : chunkText(text, SIGNAL_SEND_MAX_CHUNK);
+    const chunks = text.length <= SIGNAL_SEND_MAX_CHUNK ? [text] : chunkText(text, SIGNAL_SEND_MAX_CHUNK);
 
     for (let i = 0; i < chunks.length; i++) {
       const chunk = chunks[i]!;
