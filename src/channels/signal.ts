@@ -1212,7 +1212,14 @@ export function createSignalAdapter(config: {
         const ready = await waitForDaemon();
         if (!ready) {
           daemon.stop();
-          throw new Error('Signal daemon failed to start. Is signal-cli installed and your account linked?');
+          // Tagged NetworkError so the channel-registry retries on transient
+          // boot-time failures — signal-cli's startup account check fails when
+          // it runs before the network is reachable.
+          const err = new Error(
+            'Signal daemon failed to start. Is signal-cli installed and your account linked?',
+          );
+          (err as any).name = 'NetworkError';
+          throw err;
         }
       } else {
         const ok = await signalTcpCheck(config.tcpHost, config.tcpPort);
