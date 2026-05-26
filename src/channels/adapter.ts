@@ -163,6 +163,16 @@ export interface ChannelAdapter {
    * Returning the same platform_id on repeated calls is expected.
    */
   openDM?(userHandle: string): Promise<string>;
+
+  /**
+   * Resolve a platform-side display name for a channel/chat id. Used to
+   * populate messaging_groups.name when a channel adapter knows the
+   * platform-side title (e.g. Slack channel name, Telegram chat title).
+   * Returns null when the platform doesn't expose the name or the lookup
+   * fails. Optional — channels without a name concept (Signal 1:1, iMessage)
+   * can omit it.
+   */
+  resolveChannelName?(platformId: string): Promise<string | null>;
 }
 
 /** Factory function that creates a channel adapter (returns null if credentials missing). */
