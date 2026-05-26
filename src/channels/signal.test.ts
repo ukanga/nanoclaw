@@ -485,7 +485,7 @@ describe('SignalAdapter', () => {
     });
 
     it('drops a 0-byte placeholder attachment and warns with placeholder: true', async () => {
-      const { log } = (await import('../log.js')) as { log: { warn: ReturnType<typeof vi.fn> } };
+      const { log } = (await import('../log.js')) as unknown as { log: { warn: ReturnType<typeof vi.fn> } };
       const id = 'failedDownload';
       writeFileSync(join(cacheDir, id), Buffer.alloc(0));
 
@@ -515,7 +515,7 @@ describe('SignalAdapter', () => {
     });
 
     it('skips silently with a warn when no cache file exists for the id', async () => {
-      const { log } = (await import('../log.js')) as { log: { warn: ReturnType<typeof vi.fn> } };
+      const { log } = (await import('../log.js')) as unknown as { log: { warn: ReturnType<typeof vi.fn> } };
       const id = 'neverDownloaded';
       // Do NOT write any file for `id`.
 
@@ -1411,7 +1411,7 @@ describe('SignalAdapter', () => {
 
     it('floors retry delay to STALE_CONNECTION_MIN_DELAY_MS on stale-connection errors', async () => {
       vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
-      const { log } = (await import('../log.js')) as { log: { warn: ReturnType<typeof vi.fn> } };
+      const { log } = (await import('../log.js')) as unknown as { log: { warn: ReturnType<typeof vi.fn> } };
       const adapter = createAdapter();
       await adapter.setup(createMockSetup());
       tcpRef.fakeSocket.write.mockClear();
