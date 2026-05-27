@@ -13,6 +13,7 @@ import {
 } from './formatter.js';
 import type { AgentProvider, AgentQuery, ProviderEvent } from './providers/types.js';
 import { shouldRotateSession } from './session-rotation.js';
+import { resolveSkillCommandFallback } from './skill-commands.js';
 
 const POLL_INTERVAL_MS = 1000;
 const ACTIVE_POLL_INTERVAL_MS = 500;
@@ -175,7 +176,14 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
     const skippedSet = new Set(skipped);
     const processingIds = ids.filter((id) => !commandIds.includes(id) && !skippedSet.has(id));
     try {
-      const result = await processQuery(query, routing, processingIds, config.providerName, config.cwd);
+      const result = await processQuery(
+        query,
+        routing,
+        processingIds,
+        config.providerName,
+        config.cwd,
+        config.provider.supportsNativeSlashCommands,
+      );
       if (result.continuation && result.continuation !== continuation) {
         continuation = result.continuation;
         setContinuation(config.providerName, continuation);
@@ -217,14 +225,14 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
  * passthrough commands are sent raw (no XML wrapping) so the SDK can
  * dispatch them. Otherwise they fall through to standard XML formatting.
  */
-function formatMessagesWithCommands(messages: MessageInRow[], nativeSlashCommands: boolean): string {
+export function formatMessagesWithCommands(messages: MessageInRow[], nativeSlashCommands: boolean): string {
   const parts: string[] = [];
   const normalBatch: MessageInRow[] = [];
 
   for (const msg of messages) {
-    if (nativeSlashCommands && (msg.kind === 'chat' || msg.kind === 'chat-sdk')) {
+    if (msg.kind === 'chat' || msg.kind === 'chat-sdk') {
       const cmdInfo = categorizeMessage(msg);
-      if (cmdInfo.category === 'passthrough' || cmdInfo.category === 'admin') {
+      if (nativeSlashCommands && (cmdInfo.category === 'passthrough' || cmdInfo.category === 'admin')) {
         // Flush normal batch first
         if (normalBatch.length > 0) {
           parts.push(formatMessages(normalBatch));
@@ -233,6 +241,17 @@ function formatMessagesWithCommands(messages: MessageInRow[], nativeSlashCommand
         // Pass raw command text (no XML wrapping) — SDK handles it natively
         parts.push(cmdInfo.text);
         continue;
+      }
+      if (!nativeSlashCommands && (cmdInfo.category === 'passthrough' || cmdInfo.category === 'admin')) {
+        const fallback = resolveSkillCommandFallback(cmdInfo.text);
+        if (fallback) {
+          if (normalBatch.length > 0) {
+            parts.push(formatMessages(normalBatch));
+            normalBatch.length = 0;
+          }
+          parts.push(fallback.prompt);
+          continue;
+        }
       }
     }
     normalBatch.push(msg);
@@ -255,6 +274,7 @@ async function processQuery(
   initialBatchIds: string[],
   providerName: string,
   cwd: string,
+  nativeSlashCommands: boolean,
 ): Promise<QueryResult> {
   let queryContinuation: string | undefined;
   let done = false;
@@ -288,7 +308,7 @@ async function processQuery(
       const newIds = newMessages.map((m) => m.id);
       markProcessing(newIds);
 
-      const prompt = formatMessages(newMessages);
+      const prompt = formatMessagesWithCommands(newMessages, nativeSlashCommands);
       log(`Pushing ${newMessages.length} follow-up message(s) into active query`);
       query.push(prompt);
 
