@@ -1,23 +1,31 @@
 #!/usr/bin/env bash
-# Show NanoClaw session sizes — line count, total file size, and the
-# *live* (post-compact) byte count that the Claude Agent SDK actually
-# loads on resume. The SDK only feeds content from the last
-# compact_boundary marker onward to the model; pre-boundary turns stay
-# on disk for forensics.
+# Show NanoClaw session sizes — one row per session, sorted by approximate
+# context pressure. Cross-provider:
+#
+#   claude — line count, total bytes, *live* (post-compact) bytes that the
+#     Claude Agent SDK feeds on resume (slice from the last compact_boundary
+#     marker). Tokens are estimated as LIVE / 4 / 1024. STATUS = compacted/—.
+#
+#   codex  — line count, total bytes, exact `last_token_usage.input_tokens`
+#     from the most recent `token_count` record in the codex rollout file.
+#     STATUS = pct of model_context_window (e.g. `25%`). LIVE is left equal
+#     to TOTAL — codex's auto-compaction is internal to the app-server and
+#     the on-disk JSONL is append-only forensics.
 #
 # v2 schema notes (vs. v1):
 #   - One agent group can have multiple sessions; this script reports
 #     one row per session, not one per group.
-#   - The SDK transcript dir is per-agent-group, shared by all sessions
-#     in that agent group:
-#       data/v2-sessions/<agent_group_id>/.claude-shared/projects/-workspace-agent/
-#     Each session has its own continuation id and therefore its own
-#     <continuation>.jsonl in that dir.
+#   - claude transcript dir is per-agent-group, shared by all sessions:
+#       data/v2-sessions/<agent_group_id>/.claude-shared/projects/-workspace-agent/<continuation>.jsonl
+#   - codex transcript dir is per-session (codex provider mounts its own
+#     ~/.codex per session). File name is `rollout-<ts>-<thread_id>.jsonl`
+#     under codex/sessions/YYYY/MM/DD/, found by glob on the suffix:
+#       data/v2-sessions/<agent_group_id>/<session_id>/codex/sessions/**/rollout-*-<continuation>.jsonl
 #   - The continuation id lives in outbound.db's `session_state` table
-#     under key `continuation:claude` (per provider).
+#     under key `continuation:<provider>` (claude or codex).
 #
 # Usage:
-#   scripts/group-context-size.sh             # all sessions, sorted by live bytes
+#   scripts/group-context-size.sh             # all sessions, sorted by context pressure
 #   scripts/group-context-size.sh <group>     # one agent group only
 
 set -euo pipefail
@@ -56,7 +64,7 @@ post_compact_bytes() {
   awk -v start="$((boundary_line + 1))" 'NR >= start' "$file" | wc -c
 }
 
-# Print one session as: "<sort_key>\t<formatted-row>"
+# Print one session as: "<sort_key>\t<formatted-row>". Dispatches on provider.
 print_one_session() {
   local folder="$1" agent_group_id="$2" session_id="$3" provider="${4:-claude}"
   local out_db="$SESSIONS_DIR/$agent_group_id/$session_id/outbound.db"
@@ -73,6 +81,18 @@ print_one_session() {
     return
   fi
 
+  case "$provider" in
+    codex)
+      print_codex_row "$folder" "$agent_group_id" "$session_id" "$continuation"
+      ;;
+    *)
+      print_claude_row "$folder" "$agent_group_id" "$session_id" "$continuation"
+      ;;
+  esac
+}
+
+print_claude_row() {
+  local folder="$1" agent_group_id="$2" session_id="$3" continuation="$4"
   local jsonl="$SESSIONS_DIR/$agent_group_id/.claude-shared/projects/-workspace-agent/$continuation.jsonl"
   if [ ! -f "$jsonl" ]; then
     printf "%d\t%-20s %-12s %s\n" 0 "$folder" "${session_id:0:8}" "(jsonl missing)"
@@ -98,6 +118,51 @@ print_one_session() {
     "$(numfmt --to=iec --suffix=B "$total_bytes")" \
     "$(numfmt --to=iec --suffix=B "$live_bytes")" \
     "$((live_bytes / 4 / 1024))" "$status"
+}
+
+print_codex_row() {
+  local folder="$1" agent_group_id="$2" session_id="$3" continuation="$4"
+  local jsonl
+  jsonl=$(find "$SESSIONS_DIR/$agent_group_id/$session_id/codex/sessions" \
+    -name "rollout-*-$continuation.jsonl" 2>/dev/null | head -1)
+  if [ -z "$jsonl" ] || [ ! -f "$jsonl" ]; then
+    printf "%d\t%-20s %-12s %s\n" 0 "$folder" "${session_id:0:8}" "(jsonl missing)"
+    return
+  fi
+
+  local lines total_bytes last_tc last_input window status
+  lines=$(wc -l < "$jsonl")
+  total_bytes=$(stat -c %s "$jsonl" 2>/dev/null || stat -f %z "$jsonl")
+
+  # Pull last `token_count` event from the rollout. Codex writes exact
+  # counts per turn, so we don't have to estimate from bytes.
+  last_tc=$(grep '"type":"token_count"' "$jsonl" | tail -1 || true)
+  if [ -z "$last_tc" ]; then
+    last_input=0
+    window=0
+    status="(no turns)"
+  else
+    last_input=$(printf '%s' "$last_tc" | sed -nE 's/.*"last_token_usage":\{"input_tokens":([0-9]+).*/\1/p')
+    window=$(printf '%s' "$last_tc" | sed -nE 's/.*"model_context_window":([0-9]+).*/\1/p')
+    last_input=${last_input:-0}
+    window=${window:-0}
+    if [ "$window" -gt 0 ]; then
+      status=$(awk -v i="$last_input" -v w="$window" 'BEGIN{ printf "%d%%", (i*100)/w }')
+    else
+      status="—"
+    fi
+  fi
+
+  # Sort key: tokens × 4 puts codex rows into the same byte-equivalent
+  # magnitude as claude rows (claude's 4-bytes-per-token heuristic), so a
+  # mixed table sorts by approximate context pressure across providers.
+  # shellcheck disable=SC2059
+  printf "%d\t$ROW_FMT" \
+    "$((last_input * 4))" \
+    "$folder" "${session_id:0:8}" "$lines" \
+    "$(numfmt --to=iec --suffix=B "$total_bytes")" \
+    "$(numfmt --to=iec --suffix=B "$total_bytes")" \
+    "$((last_input / 1024))" "$status"
 }
 
 # Build the SQL filter — restricted to a single folder or all groups.
