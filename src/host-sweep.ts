@@ -94,7 +94,11 @@ export function decideStuckAction(args: {
 
   const tolerance = Math.max(CLAIM_STUCK_MS, declaredBashMs ?? 0);
   for (const claim of claims) {
-    const claimedAt = Date.parse(claim.status_changed);
+    // SQLite's `datetime('now')` writes 'YYYY-MM-DD HH:MM:SS' in UTC with
+    // no zone marker; Date.parse on a space-separated string treats it as
+    // LOCAL time, baking the host's TZ offset into every claim age. Force
+    // UTC by reshaping into ISO-with-Z.
+    const claimedAt = Date.parse(claim.status_changed.replace(' ', 'T') + 'Z');
     if (Number.isNaN(claimedAt)) continue;
     const claimAge = now - claimedAt;
     if (claimAge <= tolerance) continue;
@@ -262,7 +266,9 @@ function resetStuckProcessingRows(
     // Already rescheduled for a future retry — don't bump tries again. The
     // wake path (sweep step 2) will fire when process_after elapses and a
     // fresh container will clean the orphan claim on startup.
-    if (msg.processAfter && Date.parse(msg.processAfter) > now) continue;
+    // `process_after` is SQLite UTC ('YYYY-MM-DD HH:MM:SS', no zone) — see
+    // claim-stuck parse above for why we reshape it to ISO-with-Z.
+    if (msg.processAfter && Date.parse(msg.processAfter.replace(' ', 'T') + 'Z') > now) continue;
 
     if (msg.tries >= MAX_TRIES) {
       markMessageFailed(inDb, msg.id);
