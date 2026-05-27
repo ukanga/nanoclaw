@@ -19,7 +19,10 @@
 import fs from 'fs';
 import path from 'path';
 
+import { readEnvFile } from '../env.js';
 import { registerProviderContainerConfig } from './provider-container-registry.js';
+
+const CODEX_ENV_KEYS = ['OPENAI_API_KEY', 'CODEX_MODEL', 'OPENAI_BASE_URL'] as const;
 
 registerProviderContainerConfig('codex', (ctx) => {
   const codexDir = path.join(ctx.sessionDir, 'codex');
@@ -36,9 +39,13 @@ registerProviderContainerConfig('codex', (ctx) => {
     }
   }
 
+  // NanoClaw does not auto-load .env into process.env (see src/env.ts).
+  // Fall back to the .env file when the host process doesn't carry the
+  // value — matches the per-channel pattern (signal, webex, etc.).
+  const fileEnv = readEnvFile([...CODEX_ENV_KEYS]);
   const env: Record<string, string> = {};
-  for (const key of ['OPENAI_API_KEY', 'CODEX_MODEL', 'OPENAI_BASE_URL'] as const) {
-    const value = ctx.hostEnv[key];
+  for (const key of CODEX_ENV_KEYS) {
+    const value = ctx.hostEnv[key] ?? fileEnv[key];
     if (value) env[key] = value;
   }
 
