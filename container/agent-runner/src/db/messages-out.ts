@@ -76,6 +76,10 @@ export function writeMessageOut(msg: WriteMessageOut): number {
   return nextSeq;
 }
 
+export function getMessageOutCount(): number {
+  return (getOutboundDb().prepare('SELECT COUNT(*) AS count FROM messages_out').get() as { count: number }).count;
+}
+
 /**
  * Look up a message's platform ID by seq number.
  * Searches both inbound and outbound DBs since seq spans both.

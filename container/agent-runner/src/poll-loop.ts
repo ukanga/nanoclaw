@@ -1,6 +1,6 @@
 import { findByName, getAllDestinations, type DestinationEntry } from './destinations.js';
 import { getPendingMessages, markProcessing, markCompleted, type MessageInRow } from './db/messages-in.js';
-import { writeMessageOut } from './db/messages-out.js';
+import { getMessageOutCount, writeMessageOut } from './db/messages-out.js';
 import { touchHeartbeat, clearStaleProcessingAcks } from './db/connection.js';
 import { clearContinuation, migrateLegacyContinuation, setContinuation } from './db/session-state.js';
 import {
@@ -268,7 +268,7 @@ interface QueryResult {
   continuation?: string;
 }
 
-async function processQuery(
+export async function processQuery(
   query: AgentQuery,
   routing: RoutingContext,
   initialBatchIds: string[],
@@ -278,6 +278,8 @@ async function processQuery(
 ): Promise<QueryResult> {
   let queryContinuation: string | undefined;
   let done = false;
+  let outCount = getMessageOutCount();
+  const pendingCompletionBatches: string[][] = [initialBatchIds];
   // True while we're waiting for the SDK's `compact_boundary` result event
   // after pushing our own `/compact`. Swallows the boundary event so the
   // user doesn't see a "Context compacted..." message they didn't trigger.
@@ -311,8 +313,7 @@ async function processQuery(
       const prompt = formatMessagesWithCommands(newMessages, nativeSlashCommands);
       log(`Pushing ${newMessages.length} follow-up message(s) into active query`);
       query.push(prompt);
-
-      markCompleted(newIds);
+      pendingCompletionBatches.push(newIds);
     }
   }, ACTIVE_POLL_INTERVAL_MS);
 
@@ -346,10 +347,14 @@ async function processQuery(
         // follow-up pushes. The agent may have responded via MCP
         // (send_message) mid-turn, or the message may not need a response
         // at all — either way the turn is finished.
-        markCompleted(initialBatchIds);
         if (event.text) {
           dispatchResultText(event.text, routing);
+        } else if (getMessageOutCount() === outCount) {
+          throw new Error('Provider completed without result text or outbound message');
         }
+        const completedIds = pendingCompletionBatches.shift() ?? [];
+        markCompleted(completedIds);
+        outCount = getMessageOutCount();
         // Proactive compact: kick `/compact` before the SDK's own ~165k
         // token auto-compact would land, to keep turns snappy. Silent —
         // the next `result` (the compact boundary) is swallowed above.
@@ -358,6 +363,8 @@ async function processQuery(
           rotationInFlight = true;
           query.push('/compact');
         }
+      } else if (event.type === 'error' && !event.retryable) {
+        throw new Error(event.message);
       }
     }
   } finally {

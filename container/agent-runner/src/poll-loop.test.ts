@@ -2,9 +2,11 @@ import { describe, it, expect, beforeEach, afterEach } from 'bun:test';
 
 import { initTestSessionDb, closeSessionDb, getInboundDb, getOutboundDb } from './db/connection.js';
 import { getPendingMessages, markCompleted } from './db/messages-in.js';
-import { getUndeliveredMessages } from './db/messages-out.js';
+import { getUndeliveredMessages, writeMessageOut } from './db/messages-out.js';
 import { formatMessages, extractRouting } from './formatter.js';
+import { processQuery } from './poll-loop.js';
 import { MockProvider } from './providers/mock.js';
+import type { AgentQuery, ProviderEvent } from './providers/types.js';
 
 beforeEach(() => {
   initTestSessionDb();
@@ -189,6 +191,112 @@ describe('mock provider', () => {
     expect(results).toHaveLength(2);
     expect(results[0].text).toBe('Re: First');
     expect(results[1].text).toBe('Re: Second');
+  });
+});
+
+describe('processQuery provider errors', () => {
+  function queryFromEvents(events: ProviderEvent[]): AgentQuery {
+    return {
+      push() {},
+      end() {},
+      abort() {},
+      events: {
+        async *[Symbol.asyncIterator]() {
+          for (const event of events) yield event;
+        },
+      },
+    };
+  }
+
+  it('throws on non-retryable provider errors instead of treating the turn as completed', async () => {
+    const query = queryFromEvents([{ type: 'error', message: 'stream disconnected before completion', retryable: false }]);
+
+    await expect(
+      processQuery(
+        query,
+        { platformId: 'chan-1', channelType: 'test', threadId: null, inReplyTo: 'm1' },
+        ['m1'],
+        'codex',
+        '/tmp',
+        false,
+      ),
+    ).rejects.toThrow('stream disconnected before completion');
+
+    const ack = getOutboundDb().prepare('SELECT status FROM processing_ack WHERE message_id = ?').get('m1');
+    expect(ack).toBeNull();
+  });
+
+  it('continues after retryable provider errors and completes when a result arrives', async () => {
+    const query = queryFromEvents([
+      { type: 'error', message: 'API retry', retryable: true },
+      { type: 'result', text: 'Recovered' },
+    ]);
+
+    await processQuery(
+      query,
+      { platformId: 'chan-1', channelType: 'test', threadId: null, inReplyTo: 'm1' },
+      ['m1'],
+      'codex',
+      '/tmp',
+      false,
+    );
+
+    const ack = getOutboundDb().prepare('SELECT status FROM processing_ack WHERE message_id = ?').get('m1') as
+      | { status: string }
+      | undefined;
+    expect(ack?.status).toBe('completed');
+    expect(JSON.parse(getUndeliveredMessages()[0].content).text).toBe('Recovered');
+  });
+
+  it('throws when a provider completes with no text and no outbound message', async () => {
+    const query = queryFromEvents([{ type: 'result', text: null }]);
+
+    await expect(
+      processQuery(
+        query,
+        { platformId: 'chan-1', channelType: 'test', threadId: null, inReplyTo: 'm1' },
+        ['m1'],
+        'codex',
+        '/tmp',
+        false,
+      ),
+    ).rejects.toThrow('Provider completed without result text or outbound message');
+  });
+
+  it('allows empty provider results when a tool already wrote an outbound message', async () => {
+    const query: AgentQuery = {
+      push() {},
+      end() {},
+      abort() {},
+      events: {
+        async *[Symbol.asyncIterator]() {
+          writeMessageOut({
+            id: 'tool-out',
+            in_reply_to: 'm1',
+            kind: 'chat',
+            platform_id: 'chan-1',
+            channel_type: 'test',
+            content: JSON.stringify({ text: 'sent by tool' }),
+          });
+          yield { type: 'result', text: null };
+        },
+      },
+    };
+
+    await processQuery(
+      query,
+      { platformId: 'chan-1', channelType: 'test', threadId: null, inReplyTo: 'm1' },
+      ['m1'],
+      'codex',
+      '/tmp',
+      false,
+    );
+
+    const ack = getOutboundDb().prepare('SELECT status FROM processing_ack WHERE message_id = ?').get('m1') as
+      | { status: string }
+      | undefined;
+    expect(ack?.status).toBe('completed');
+    expect(JSON.parse(getUndeliveredMessages()[0].content).text).toBe('sent by tool');
   });
 });
 
